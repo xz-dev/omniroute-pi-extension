@@ -14,7 +14,10 @@ interface OmnirouteModel {
   id: string;
   name?: string;
   root?: string;
+  parent?: string | null;
+  owned_by?: string;
   type?: string;
+  family?: string | null;
   capabilities?: {
     reasoning?: boolean;
     thinking?: boolean;
@@ -27,10 +30,41 @@ interface OmnirouteModel {
   max_input_tokens?: number;
 }
 
+interface ReasoningConfigSchema {
+  properties?: {
+    reasoningEffort?: {
+      enum?: unknown;
+    };
+  };
+}
+
+interface VscodeModel {
+  id?: string;
+  root?: string;
+  owned_by?: string;
+  parent?: string | null;
+  supportedReasoningEfforts?: unknown;
+  supportsReasoningEffort?: unknown;
+  supports_reasoning_effort?: unknown;
+  configSchema?: ReasoningConfigSchema;
+  configurationSchema?: ReasoningConfigSchema;
+}
+
+interface DataPayload<T> {
+  data?: T[];
+}
+
 type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
+type ReasoningEffort = ThinkingLevel;
+
 
 const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
+const DEEPSEEK_THINKING_FAMILY = "deepseek-thinking";
+const DEEPSEEK_COMPAT = {
+  thinkingFormat: "deepseek",
+  requiresReasoningContentOnAssistantMessages: true,
+} as const;
 
 function isTextModel(model: OmnirouteModel): boolean {
   if (model.type === "image") return false;
@@ -42,6 +76,7 @@ function betterModel(a: OmnirouteModel, b: OmnirouteModel): OmnirouteModel {
   const aImage = a.input_modalities?.includes("image") ?? false;
   const bImage = b.input_modalities?.includes("image") ?? false;
   if (!aImage && bImage) return b;
+
   if (aImage === bImage) {
     const aContext = a.context_length ?? a.max_input_tokens ?? 0;
     const bContext = b.context_length ?? b.max_input_tokens ?? 0;
@@ -55,9 +90,15 @@ function betterModel(a: OmnirouteModel, b: OmnirouteModel): OmnirouteModel {
   return a;
 }
 
-function thinkingLevelMap(levels: Iterable<ThinkingLevel>) {
+function normalizeThinkingLevels(levels: ThinkingLevel[], options?: { xhighValue?: string }) {
   const has = new Set(levels);
-  return Object.fromEntries(THINKING_LEVELS.map((level) => [level, has.has(level) ? level : null])) as Record<ThinkingLevel, string | null>;
+  return Object.fromEntries(
+    THINKING_LEVELS.map((level) => [level, has.has(level) ? (level === "xhigh" ? (options?.xhighValue ?? level) : level) : null]),
+  ) as Record<ThinkingLevel, string | null>;
+}
+
+function mergeThinkingLevels(baseLevels: ThinkingLevel[], extraLevels: ReasoningEffort[]) {
+  return [...new Set([...baseLevels, ...extraLevels])];
 }
 
 function isThinkingVariant(id: string): { base: string; level?: ThinkingLevel } {
@@ -70,14 +111,122 @@ function isThinkingVariant(id: string): { base: string; level?: ThinkingLevel } 
   return { base: id.slice(0, dash), level: suffix as ThinkingLevel };
 }
 
+function parseReasoningEfforts(values: unknown): ReasoningEffort[] {
+  if (!Array.isArray(values)) return [];
+
+  const efforts: ReasoningEffort[] = [];
+
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+
+    const normalized = value.trim().toLowerCase().replace(/[_\s-]+/g, "");
+    if (normalized === "off" || normalized === "none") continue;
+
+    const effort = normalized === "max" ? "xhigh" : (normalized as ReasoningEffort);
+    if (!THINKING_LEVEL_SET.has(effort)) continue;
+
+    if (!efforts.includes(effort)) {
+      efforts.push(effort);
+    }
+  }
+
+  return efforts;
+}
+
+function getEffortsFromVscodeModel(model: VscodeModel): ReasoningEffort[] {
+  for (const candidate of [
+    model.supportsReasoningEffort,
+    model.supports_reasoning_effort,
+    model.supportedReasoningEfforts,
+    model.configSchema?.properties?.reasoningEffort?.enum,
+    model.configurationSchema?.properties?.reasoningEffort?.enum,
+  ]) {
+    const efforts = parseReasoningEfforts(candidate);
+    if (efforts.length > 0) return efforts;
+  }
+
+  return [];
+}
+
+function normalizeModelToken(value?: string | null) {
+  return value?.trim().toLowerCase();
+}
+
+function addModelKey(keys: Set<string>, value?: string | null) {
+  const key = normalizeModelToken(value);
+  if (key) keys.add(key);
+}
+
+function strictModelKeys(model: { id?: string; root?: string; parent?: string | null; owned_by?: string }) {
+  const keys = new Set<string>();
+  addModelKey(keys, model.id);
+  addModelKey(keys, model.parent);
+  if (model.owned_by && model.root) addModelKey(keys, `${model.owned_by}/${model.root}`);
+  return [...keys];
+}
+
+function rootModelKey(model: { root?: string }) {
+  return normalizeModelToken(model.root);
+}
+
+function mergeEffortIntoIndex(index: Map<string, ReasoningEffort[]>, key: string | undefined, efforts: ReasoningEffort[]) {
+  if (!key) return;
+  index.set(key, mergeThinkingLevels(index.get(key) ?? [], efforts));
+}
+
+function buildVscodeEffortIndex(vscodeModels: VscodeModel[]) {
+  const strict = new Map<string, ReasoningEffort[]>();
+  const rootCandidates = new Map<string, { count: number; efforts: ReasoningEffort[] }>();
+
+  for (const model of vscodeModels) {
+    const efforts = getEffortsFromVscodeModel(model);
+    if (efforts.length === 0) continue;
+
+    for (const key of strictModelKeys(model)) {
+      mergeEffortIntoIndex(strict, key, efforts);
+    }
+
+    const rootKey = rootModelKey(model);
+    if (rootKey) {
+      const current = rootCandidates.get(rootKey) ?? { count: 0, efforts: [] };
+      rootCandidates.set(rootKey, {
+        count: current.count + 1,
+        efforts: mergeThinkingLevels(current.efforts, efforts),
+      });
+    }
+  }
+
+  const root = new Map<string, ReasoningEffort[]>();
+  for (const [key, candidate] of rootCandidates) {
+    if (candidate.count === 1) root.set(key, candidate.efforts);
+  }
+
+  return { strict, root };
+}
+
+type VscodeEffortIndex = ReturnType<typeof buildVscodeEffortIndex>;
+
+function getVscodeEffortsForModel(model: OmnirouteModel, effortIndex: VscodeEffortIndex) {
+  let efforts: ReasoningEffort[] = [];
+  for (const key of strictModelKeys(model)) {
+    efforts = mergeThinkingLevels(efforts, effortIndex.strict.get(key) ?? []);
+  }
+  if (efforts.length > 0) return efforts;
+
+  return effortIndex.root.get(rootModelKey(model) ?? "") ?? [];
+}
+
 function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]) {
-  const reasoning = Boolean(model.capabilities?.reasoning || model.capabilities?.thinking);
+  const reasoning = Boolean(model.capabilities?.reasoning || model.capabilities?.thinking || levels.length > 0);
+  const isDeepseekFamily = model.family === DEEPSEEK_THINKING_FAMILY;
+  const thinkingLevelMap = normalizeThinkingLevels(levels, { xhighValue: isDeepseekFamily ? "max" : undefined });
 
   return {
     id: model.id,
     name: model.root ?? model.name ?? model.id,
     reasoning,
-    ...(reasoning ? { thinkingLevelMap: thinkingLevelMap(levels) } : {}),
+    ...(reasoning ? { thinkingLevelMap } : {}),
+    ...(reasoning && isDeepseekFamily ? { compat: DEEPSEEK_COMPAT } : {}),
     input: (model.input_modalities?.includes("image") ? ["text", "image"] : ["text"]) as Array<"text" | "image">,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.context_length ?? model.max_input_tokens ?? DEFAULT_CONTEXT_WINDOW,
@@ -85,9 +234,9 @@ function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]) {
   };
 }
 
-function normalizeModels(rawModels: OmnirouteModel[]) {
+function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortIndex) {
   const deduped = new Map<string, OmnirouteModel>();
-  for (const model of rawModels.filter((m) => m?.id && isTextModel(m))) {
+  for (const model of rawModels.filter((candidate) => candidate?.id && isTextModel(candidate))) {
     const current = deduped.get(model.id);
     deduped.set(model.id, current ? betterModel(current, model) : model);
   }
@@ -96,7 +245,6 @@ function normalizeModels(rawModels: OmnirouteModel[]) {
   const used = new Set<string>();
   const normalized: ReturnType<typeof toProviderModel>[] = [];
 
-  // Merge explicit thinking variants into base models.
   for (const [id, model] of models) {
     if (used.has(id)) continue;
 
@@ -104,7 +252,7 @@ function normalizeModels(rawModels: OmnirouteModel[]) {
     const matchedLevels: ThinkingLevel[] = [];
 
     if (!level) {
-      for (const [variantId, variant] of models) {
+      for (const [variantId] of models) {
         if (used.has(variantId)) continue;
         const parsed = isThinkingVariant(variantId);
         if (parsed.base === id && parsed.level) {
@@ -113,19 +261,39 @@ function normalizeModels(rawModels: OmnirouteModel[]) {
         }
       }
 
+      const levels = mergeThinkingLevels(matchedLevels, getVscodeEffortsForModel(model, effortIndex));
+
       used.add(id);
-      normalized.push(toProviderModel(model, matchedLevels));
+      normalized.push(toProviderModel(model, levels));
       continue;
     }
 
-    // If a variant appears without its base model, register it as-is.
     if (!used.has(base)) {
+      const levels = mergeThinkingLevels([level], getVscodeEffortsForModel(model, effortIndex));
       used.add(id);
-      normalized.push(toProviderModel(model, level ? [level] : []));
+      normalized.push(toProviderModel(model, levels));
     }
   }
 
   return normalized;
+}
+
+function deriveVscodeModelsUrl(baseUrl: string) {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+
+  try {
+    const url = new URL(trimmed);
+    const pathParts = url.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+    if (pathParts[pathParts.length - 1] === "v1") pathParts.pop();
+    if (pathParts[pathParts.length - 1] === "api") pathParts.pop();
+
+    url.pathname = `/${[...pathParts, "api", "v1", "vscode", "_", "models"].join("/")}`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return `${trimmed.replace(/(?:\/api)?\/v1$/, "")}/api/v1/vscode/_/models`;
+  }
 }
 
 function cleanConfigValue(value: string | undefined) {
@@ -156,21 +324,47 @@ async function discoverModels() {
     return [];
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MODEL_DISCOVERY_TIMEOUT_MS);
+  const headers = { Authorization: `${AUTH_HEADER_PREFIX}${apiKey}` };
+  const timeoutSignal = new AbortController();
+  const timeout = setTimeout(() => timeoutSignal.abort(), MODEL_DISCOVERY_TIMEOUT_MS);
 
   try {
-    const response = await fetch(`${baseUrl}/models`, {
-      headers: { Authorization: `${AUTH_HEADER_PREFIX}${apiKey}` },
-      signal: controller.signal,
+    const mainResponse = await fetch(`${baseUrl}/models`, {
+      headers,
+      signal: timeoutSignal.signal,
     });
 
-    if (!response.ok) {
-      throw new Error(await responseErrorSummary(response));
+    if (!mainResponse.ok) {
+      throw new Error(await responseErrorSummary(mainResponse));
     }
 
-    const payload = (await response.json()) as { data?: OmnirouteModel[] };
-    const models = normalizeModels(payload.data ?? []);
+    const payload = (await mainResponse.json()) as DataPayload<OmnirouteModel>;
+
+    const vscodeModelsUrl = deriveVscodeModelsUrl(baseUrl);
+    let vscodeEffortsIndex = buildVscodeEffortIndex([]);
+
+    try {
+      const vscodeResponse = await fetch(vscodeModelsUrl, {
+        headers,
+        signal: timeoutSignal.signal,
+      });
+
+      if (vscodeResponse.ok) {
+        const vscodePayload = (await vscodeResponse.json()) as DataPayload<VscodeModel>;
+        vscodeEffortsIndex = buildVscodeEffortIndex(vscodePayload.data ?? []);
+      } else if (vscodeResponse.status !== 404) {
+        console.warn(
+          `[${PROVIDER}] VSCode model effort discovery failed (${vscodeResponse.status}); continuing with suffix inference only.`,
+        );
+      }
+    } catch (vscodeError) {
+      console.warn(
+        `[${PROVIDER}] VSCode model effort discovery failed; continuing with suffix inference only.`,
+        vscodeError instanceof Error ? vscodeError.message : vscodeError,
+      );
+    }
+
+    const models = normalizeModels(payload.data ?? [], vscodeEffortsIndex);
     if (models.length > 0) return models;
 
     throw new Error("Model discovery returned no usable text models");
