@@ -1,0 +1,806 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterEach, beforeEach, describe, it } from "node:test";
+
+import extension from "../index.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const fixturePath = join(__dirname, "fixtures", "omniroute-models.json");
+const projectRoot = resolve(__dirname, "..");
+
+interface RegisteredProvider {
+  name: string;
+  config: {
+    name?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    api?: string;
+    models?: Array<Record<string, unknown>>;
+  };
+}
+
+interface SessionStartHandler {
+  (event: { type: "session_start"; reason: "startup" }, ctx: { mode: string }): void;
+}
+
+interface ExtensionHarness {
+  api: ExtensionAPI;
+  registeredProviders: RegisteredProvider[];
+  readonly registerProviderCalls: number;
+  sessionStartHandlers: SessionStartHandler[];
+}
+
+interface FixtureServer {
+  baseUrl: string;
+  readonly requests: number;
+  readonly responses: number;
+  waitForRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
+  waitForResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
+  close(): Promise<void>;
+}
+
+function createHarness(options: { throwOnRegisterAt?: number } = {}): ExtensionHarness {
+  const registeredProviders: RegisteredProvider[] = [];
+  let registerProviderCalls = 0;
+  const sessionStartHandlers: SessionStartHandler[] = [];
+
+  const api = {
+    on(event: string, handler: SessionStartHandler) {
+      if (event === "session_start") sessionStartHandlers.push(handler);
+    },
+    registerProvider(name: string, config: RegisteredProvider["config"]) {
+      registerProviderCalls += 1;
+      if (options.throwOnRegisterAt === registerProviderCalls) {
+        throw new Error(`registerProvider failed for ${name}`);
+      }
+      registeredProviders.push({ name, config });
+    },
+  } as unknown as ExtensionAPI;
+
+  return {
+    api,
+    registeredProviders,
+    get registerProviderCalls() {
+      return registerProviderCalls;
+    },
+    sessionStartHandlers,
+  };
+}
+
+function setTTY(stdinTTY: boolean, stdoutTTY: boolean) {
+  Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: stdinTTY });
+  Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: stdoutTTY });
+}
+
+function setProcessArgs(args: string[]) {
+  process.argv = [process.argv[0]!, join(projectRoot, "index.ts"), ...args];
+}
+
+function startSession(harness: ExtensionHarness, mode: "tui" | "rpc" | "json") {
+  assert.equal(harness.sessionStartHandlers.length, 1, "extension should register exactly one session_start handler");
+  harness.sessionStartHandlers[0]!({ type: "session_start", reason: "startup" }, { mode });
+}
+
+function latestProvider(harness: ExtensionHarness) {
+  return harness.registeredProviders.at(-1);
+}
+
+function modelIds(registration: RegisteredProvider | undefined) {
+  return registration?.config.models?.map((model) => model.id) ?? [];
+}
+
+function createWaiterQueue() {
+  let value = 0;
+  const waiters: Array<{ target: number; resolve: () => void; reject: (error: Error) => void; timeout: NodeJS.Timeout }> = [];
+
+  return {
+    get value() {
+      return value;
+    },
+    increment() {
+      value += 1;
+      while (waiters.length > 0 && value >= waiters[0]!.target) {
+        const waiter = waiters.shift()!;
+        clearTimeout(waiter.timeout);
+        waiter.resolve();
+      }
+    },
+    waitFor(target: number, message: string, timeoutMs = 1000) {
+      if (value >= target) return Promise.resolve();
+      return new Promise<void>((resolve, reject) => {
+        const waiter = {
+          target,
+          timeout: setTimeout(() => {
+            const index = waiters.indexOf(waiter);
+            if (index >= 0) {
+              waiters.splice(index, 1);
+            }
+            reject(new assert.AssertionError({ message: `${message} (timed out after ${timeoutMs}ms; current=${value}, target=${target})` }));
+          }, timeoutMs),
+          resolve,
+          reject,
+        };
+        waiters.push(waiter);
+      });
+    },
+  };
+}
+
+async function createFixtureServer(options: { delayMs?: number; status?: number; body?: string } = {}): Promise<FixtureServer> {
+  const fixture = await readFile(fixturePath, "utf8");
+  const requestCounter = createWaiterQueue();
+  const responseCounter = createWaiterQueue();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.url !== "/v1/models") {
+      res.writeHead(404).end();
+      return;
+    }
+
+    requestCounter.increment();
+    res.on("finish", () => {
+      responseCounter.increment();
+    });
+
+    if (options.delayMs) {
+      await new Promise((resolve) => setTimeout(resolve, options.delayMs));
+    }
+
+    res.writeHead(options.status ?? 200, { "content-type": "application/json" });
+    res.end(options.body ?? fixture);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+
+  const address = server.address();
+  assert.ok(address && typeof address === "object", "fixture server should bind to an address");
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    get requests() {
+      return requestCounter.value;
+    },
+    get responses() {
+      return responseCounter.value;
+    },
+    waitForRequests: (target: number, message: string, timeoutMs?: number) => requestCounter.waitFor(target, message, timeoutMs),
+    waitForResponses: (target: number, message: string, timeoutMs?: number) => responseCounter.waitFor(target, message, timeoutMs),
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+  };
+}
+
+async function readFixtureModels() {
+  const payload = JSON.parse(await readFile(fixturePath, "utf8")) as { data?: Array<Record<string, unknown>> };
+  assert.ok(Array.isArray(payload.data), "fixture should expose a data array");
+  return payload.data;
+}
+
+function createValidCacheJson(baseUrl: string, modelId = "cached-test-model") {
+  return `${JSON.stringify(
+    {
+      schemaVersion: 1,
+      provider: "omniroute",
+      baseUrl,
+      fetchedAt: "2026-06-20T00:00:00.000Z",
+      models: [
+        {
+          id: modelId,
+          name: "Cached Test Model",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 4096,
+        },
+      ],
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+async function writeValidCache(cachePath: string, baseUrl: string, modelId = "cached-test-model") {
+  await writeFile(cachePath, createValidCacheJson(baseUrl, modelId));
+}
+
+async function settleAsyncWork() {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+async function waitForCount(
+  readCount: () => number,
+  expected: number,
+  message: string,
+  timeoutMs = 1000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (readCount() === expected) return;
+    await settleAsyncWork();
+  }
+
+  assert.fail(`${message} (timed out after ${timeoutMs}ms; current=${readCount()}, target=${expected})`);
+}
+
+async function expectCountToStayStable(
+  readCount: () => number,
+  expected: number,
+  durationMs: number,
+  message: string,
+) {
+  const deadline = Date.now() + durationMs;
+  while (Date.now() < deadline) {
+    assert.equal(readCount(), expected, message);
+    await settleAsyncWork();
+  }
+}
+
+async function captureConsoleWarns<T>(fn: () => Promise<T>) {
+  const originalWarn = console.warn;
+  const warns: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    warns.push(args.map((arg) => String(arg)).join(" "));
+  };
+
+  try {
+    const value = await fn();
+    return { value, warns };
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+function defaultCachePath(baseUrl: string, agentDir: string) {
+  const hash = createHash("sha256").update(baseUrl).digest("hex").slice(0, 16);
+  return join(agentDir, "omniroute", `models-${hash}.json`);
+}
+
+let oldArgv: string[];
+let oldEnv: NodeJS.ProcessEnv;
+let oldStdinIsTTY: PropertyDescriptor | undefined;
+let oldStdoutIsTTY: PropertyDescriptor | undefined;
+let tempDir: string;
+
+beforeEach(async () => {
+  oldArgv = [...process.argv];
+  oldEnv = { ...process.env };
+  oldStdinIsTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  oldStdoutIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  tempDir = await mkdtemp(join(tmpdir(), "omniroute-cache-test-"));
+
+  setProcessArgs([]);
+  setTTY(true, true);
+  process.env.OMNIROUTE_API_KEY = "test-key";
+  process.env.OMNIROUTE_MODEL_DISCOVERY_TIMEOUT_MS = "100";
+});
+
+afterEach(async () => {
+  process.argv = oldArgv;
+  process.env = oldEnv;
+
+  if (oldStdinIsTTY) Object.defineProperty(process.stdin, "isTTY", oldStdinIsTTY);
+  else delete (process.stdin as { isTTY?: boolean }).isTTY;
+
+  if (oldStdoutIsTTY) Object.defineProperty(process.stdout, "isTTY", oldStdoutIsTTY);
+  else delete (process.stdout as { isTTY?: boolean }).isTTY;
+
+  await rm(tempDir, { recursive: true, force: true });
+});
+
+function configureCacheStartup(baseUrl: string, cachePath: string | undefined, argv: string[] = []) {
+  process.env.OMNIROUTE_BASE_URL = baseUrl;
+  if (cachePath === undefined) delete process.env.OMNIROUTE_MODEL_CACHE_PATH;
+  else process.env.OMNIROUTE_MODEL_CACHE_PATH = cachePath;
+  setProcessArgs(argv);
+}
+
+describe("OmniRoute model catalog cache", () => {
+  it("uses cache only for interactive startup, not --list-models", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath);
+
+      const interactive = createHarness();
+      extension(interactive.api);
+      assert.equal(server.requests, 0, "interactive startup should not hit live discovery before session_start");
+      assert.deepEqual(modelIds(latestProvider(interactive)), ["cached-test-model"], "interactive TUI startup should register the cached provider immediately");
+      assert.equal(latestProvider(interactive)!.config.apiKey, "$OMNIROUTE_API_KEY", "cached startup should keep the literal discovery key reference");
+
+      const listModels = createHarness();
+      configureCacheStartup(server.baseUrl, cachePath, ["--list-models"]);
+      extension(listModels.api);
+      assert.equal(listModels.registeredProviders.length, 0, "--list-models should not use the startup cache path");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not register cached models for non-interactive startup modes", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cases = [
+        { name: "--help", argv: ["--help"] },
+        { name: "-h", argv: ["-h"] },
+        { name: "--print", argv: ["--print"] },
+        { name: "-p", argv: ["-p"] },
+        { name: "--mode rpc", argv: ["--mode", "rpc"] },
+        { name: "--mode=json", argv: ["--mode=json"] },
+      ] as const;
+
+      for (const testCase of cases) {
+        const cachePath = join(tempDir, `${testCase.name.replace(/[^a-z0-9]+/gi, "-")}.json`);
+        await writeValidCache(cachePath, server.baseUrl);
+        configureCacheStartup(server.baseUrl, cachePath, [...testCase.argv]);
+
+        const harness = createHarness();
+        assert.doesNotThrow(() => extension(harness.api), `${testCase.name} startup should not throw`);
+        assert.equal(server.requests, 0, `${testCase.name} should not hit live discovery before session_start`);
+        assert.equal(harness.registeredProviders.length, 0, `${testCase.name} should skip cached model registration`);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not register cached models when stdin or stdout is not a TTY", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cases = [
+        { name: "stdin non-TTY", stdinTTY: false, stdoutTTY: true },
+        { name: "stdout non-TTY", stdinTTY: true, stdoutTTY: false },
+      ] as const;
+
+      for (const testCase of cases) {
+        const cachePath = join(tempDir, `${testCase.name.replace(/[^a-z0-9]+/gi, "-")}.json`);
+        await writeValidCache(cachePath, server.baseUrl);
+        configureCacheStartup(server.baseUrl, cachePath, []);
+        setTTY(testCase.stdinTTY, testCase.stdoutTTY);
+
+        const harness = createHarness();
+        extension(harness.api);
+        assert.equal(server.requests, 0, `${testCase.name} should not use the cache or hit live discovery`);
+        assert.equal(harness.registeredProviders.length, 0, `${testCase.name} should not use the cache`);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("rejects invalid or mismatched cache files without throwing", async () => {
+    const server = await createFixtureServer();
+    try {
+      const validBaseUrl = server.baseUrl;
+      const mismatchedBaseUrl = `${server.baseUrl}-other`;
+      const cases = [
+        {
+          name: "wrong schema version",
+          content: createValidCacheJson(validBaseUrl).replace('"schemaVersion": 1', '"schemaVersion": 2'),
+        },
+        {
+          name: "wrong provider",
+          content: createValidCacheJson(validBaseUrl).replace('"provider": "omniroute"', '"provider": "other"'),
+        },
+        {
+          name: "wrong baseUrl",
+          content: createValidCacheJson(mismatchedBaseUrl),
+        },
+        {
+          name: "empty models array",
+          content: `${JSON.stringify({ schemaVersion: 1, provider: "omniroute", baseUrl: validBaseUrl, fetchedAt: "2026-06-20T00:00:00.000Z", models: [] }, null, 2)}\n`,
+        },
+        {
+          name: "malformed JSON",
+          content: "{\n  \"schemaVersion\": 1,\n  \"provider\": \"omniroute\"\n",
+        },
+        {
+          name: "invalid model shape",
+          content: `${JSON.stringify(
+            {
+              schemaVersion: 1,
+              provider: "omniroute",
+              baseUrl: validBaseUrl,
+              fetchedAt: "2026-06-20T00:00:00.000Z",
+              models: [{ id: "broken-model" }],
+            },
+            null,
+            2,
+          )}\n`,
+        },
+      ] as const;
+
+      const { warns } = await captureConsoleWarns(async () => {
+        for (const testCase of cases) {
+          const cachePath = join(tempDir, `${testCase.name.replace(/[^a-z0-9]+/gi, "-")}.json`);
+          await writeFile(cachePath, testCase.content);
+          configureCacheStartup(validBaseUrl, cachePath, []);
+
+          const harness = createHarness();
+          assert.doesNotThrow(() => extension(harness.api), `${testCase.name} should not throw during startup`);
+          assert.equal(harness.registeredProviders.length, 0, `${testCase.name} should not register a cached provider`);
+        }
+      });
+
+      assert.ok(warns.some((line) => line.includes("Ignoring invalid model cache") || line.includes("Could not read model cache")), "invalid cache cases should emit expected warnings");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("registers cached models on startup even when OMNIROUTE_API_KEY is missing, but does not refresh until credentials exist", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "missing-api-key.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      delete process.env.OMNIROUTE_API_KEY;
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+      assert.equal(server.requests, 0, "cached startup without credentials should not hit live discovery before session_start");
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "cached startup without credentials should still register the cached provider immediately");
+      assert.equal(latestProvider(harness)!.config.apiKey, "$OMNIROUTE_API_KEY", "cached startup should keep the literal discovery key reference");
+
+      const originalCache = await readFile(cachePath, "utf8");
+      startSession(harness, "tui");
+      await expectCountToStayStable(() => server.requests, 0, 100, "missing API key should prevent TUI refresh from hitting live discovery");
+      assert.equal(await readFile(cachePath, "utf8"), originalCache, "missing API key should not rewrite the cache");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("refreshes from a local fixture server after TUI session_start and writes a normalized cache", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+      assert.equal(server.requests, 0, "cached startup should stay offline until a session_start refresh runs");
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "cached startup should register the local provider before refresh begins");
+      assert.equal(latestProvider(harness)!.config.apiKey, "$OMNIROUTE_API_KEY", "cached startup should keep the literal discovery key reference");
+
+      startSession(harness, "tui");
+      await server.waitForResponses(1, "TUI refresh should complete and respond once");
+      await waitForProviderCount(harness, 2, "fresh provider registration should replace the cached provider after live discovery");
+
+      assert.equal(server.requests, 1, "TUI refresh should issue exactly one live /models request");
+      assert.equal(latestProvider(harness)!.name, "omniroute", "live provider should be registered under the OmniRoute provider key");
+      assert.ok(latestProvider(harness)!.config.models!.length > 100, "real OmniRoute fixture should normalize to a large live catalog");
+      assert.ok(!modelIds(latestProvider(harness)).includes("cached-test-model"), "cached placeholder model should not survive live refresh");
+
+      const cache = JSON.parse(await readFile(cachePath, "utf8"));
+      assert.equal(cache.provider, "omniroute", "cache should store the provider name only");
+      assert.equal(cache.baseUrl, server.baseUrl, "cache should normalize the baseUrl used for discovery");
+      assert.ok(Array.isArray(cache.models), "cache should store model entries");
+      assert.ok(cache.models.length > 100, "cache should contain the refreshed live catalog");
+      assert.equal(cache.models.some((model: { id: string }) => model.id === "cached-test-model"), false, "refreshed cache should replace the placeholder model set");
+
+      const secondStartup = createHarness();
+      configureCacheStartup(server.baseUrl, cachePath, []);
+      extension(secondStartup.api);
+      assert.ok(secondStartup.registeredProviders.length === 1, "normalized cache should be usable on a subsequent startup without hitting live discovery");
+      assert.equal(latestProvider(secondStartup)!.config.baseUrl, server.baseUrl, "subsequent startup should read the normalized baseUrl from cache");
+      assert.ok(latestProvider(secondStartup)!.config.models!.length > 100, "subsequent startup should restore the refreshed live catalog from cache");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("refreshes again when a later TUI session_start happens after the first refresh completed", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "repeat-refresh.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+      startSession(harness, "tui");
+      await server.waitForResponses(1, "first TUI refresh should complete before testing the next session_start");
+      await waitForProviderCount(harness, 2, "first refresh should register a live provider");
+
+      startSession(harness, "tui");
+      await server.waitForResponses(2, "later TUI session_start should trigger a second live refresh after the first completed");
+      await waitForProviderCount(harness, 3, "later TUI session_start should register another refreshed provider");
+
+      assert.equal(server.requests, 2, "each completed TUI session_start should refresh the live catalog again");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("handles async provider registration failures without unhandled rejections", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "register-throws.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness({ throwOnRegisterAt: 2 });
+      const unhandledRejections: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => {
+        unhandledRejections.push(reason);
+      };
+      process.on("unhandledRejection", onUnhandledRejection);
+
+      try {
+        const { warns } = await captureConsoleWarns(async () => {
+          extension(harness.api);
+          startSession(harness, "tui");
+          await server.waitForResponses(1, "throwing registerProvider should still complete the live discovery response");
+          await waitForCount(() => harness.registerProviderCalls, 2, "throwing registerProvider should still be attempted once during async refresh");
+        });
+
+        assert.equal(unhandledRejections.length, 0, "async refresh provider registration failures should not become unhandled rejections");
+        assert.ok(
+          warns.some((line) => line.includes("provider update failed") || line.includes("registerProvider failed")),
+          "async provider registration failure should be logged",
+        );
+      } finally {
+        process.off("unhandledRejection", onUnhandledRejection);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("coalesces concurrent TUI session_start refreshes into one live request", async () => {
+    process.env.OMNIROUTE_MODEL_DISCOVERY_TIMEOUT_MS = "1000";
+    const server = await createFixtureServer({ delayMs: 250 });
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+
+      startSession(harness, "tui");
+      startSession(harness, "tui");
+
+      await server.waitForResponses(1, "concurrent TUI refreshes should still complete one live request");
+      await waitForProviderCount(harness, 2, "pending refreshes should coalesce into a single live provider update");
+
+      assert.equal(server.requests, 1, "concurrent TUI session_start calls should issue only one live /models request");
+      assert.equal(modelIds(latestProvider(harness)).includes("cached-test-model"), false, "fresh provider should replace the placeholder cache contents");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not refresh or rewrite cache for non-TUI session_start", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const originalCache = await readFile(cachePath, "utf8");
+      const harness = createHarness();
+      extension(harness.api);
+
+      startSession(harness, "rpc");
+      startSession(harness, "json");
+
+      assert.equal(server.requests, 0, "non-TUI session_start should not trigger live /models discovery");
+      assert.equal(await readFile(cachePath, "utf8"), originalCache, "non-TUI session_start should not rewrite the cache");
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "non-TUI session_start should keep the cached provider intact");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("keeps cached provider and cache when discovery returns invalid payloads", async () => {
+    const fixtureModels = await readFixtureModels();
+    const imageOnlyModel = fixtureModels.find((model) => model.id === "codex/gpt-5.5" && model.type === "image");
+    assert.ok(imageOnlyModel, "fixture should include the unusable image-output codex/gpt-5.5 variant");
+    assert.equal(
+      Array.isArray(imageOnlyModel!.output_modalities) && imageOnlyModel!.output_modalities.includes("text"),
+      false,
+      "image-output codex/gpt-5.5 should be unusable for text discovery",
+    );
+
+    const payloadCases = [
+      { name: "invalid JSON", body: "{\"data\": [" },
+      { name: "empty data array", body: JSON.stringify({ data: [] }) },
+      { name: "unusable non-text payload", body: JSON.stringify({ data: [imageOnlyModel] }) },
+    ] as const;
+
+    for (const payloadCase of payloadCases) {
+      const server = await createFixtureServer({ body: payloadCase.body });
+      try {
+        const cachePath = join(tempDir, `${payloadCase.name.replace(/[^a-z0-9]+/gi, "-")}.json`);
+        await writeValidCache(cachePath, server.baseUrl);
+        const originalCache = await readFile(cachePath, "utf8");
+        configureCacheStartup(server.baseUrl, cachePath, []);
+
+        const harness = createHarness();
+        const { warns } = await captureConsoleWarns(async () => {
+          extension(harness.api);
+          startSession(harness, "tui");
+
+          await server.waitForResponses(1, `${payloadCase.name} should still complete one discovery response`);
+          await expectCountToStayStable(() => harness.registeredProviders.length, 1, 100, `${payloadCase.name} should not register a fresh provider`);
+
+          assert.equal(server.requests, 1, `${payloadCase.name} should still be attempted exactly once`);
+          assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], `${payloadCase.name} should leave the cached provider unchanged`);
+          assert.equal(await readFile(cachePath, "utf8"), originalCache, `${payloadCase.name} should not rewrite the cache on invalid discovery`);
+        });
+
+        assert.ok(warns.some((line) => line.includes("Model discovery failed") || line.includes("Ignoring invalid model cache")), `${payloadCase.name} should emit an expected warning`);
+      } finally {
+        await server.close();
+      }
+    }
+  });
+
+  it("normalizes real OmniRoute models from the fixture into semantic provider entries", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const fixtureModels = await readFixtureModels();
+      const codexGpt55Variants = fixtureModels.filter((model) => model.id === "codex/gpt-5.5");
+      assert.equal(codexGpt55Variants.length, 2, "fixture should include one text-capable and one image-output GPT 5.5 variant under the same ID");
+      assert.ok(codexGpt55Variants.some((model) => model.type === "image"), "fixture should include the unusable image-output GPT 5.5 variant to prove filtering works");
+      assert.ok(codexGpt55Variants.some((model) => Array.isArray(model.output_modalities) && model.output_modalities.includes("text")), "fixture should include the usable text-output GPT 5.5 variant");
+
+      const harness = createHarness();
+      extension(harness.api);
+      startSession(harness, "tui");
+      await server.waitForResponses(1, "real fixture normalization should complete once the live catalog is fetched");
+      await waitForProviderCount(harness, 2, "live refresh should register a normalized provider list");
+
+      const models = latestProvider(harness)!.config.models ?? [];
+      const modelById = new Map(models.map((model) => [model.id, model]));
+
+      const textOnly = modelById.get("oc/big-pickle");
+      assert.ok(textOnly, "fixture should normalize the text-only Big Pickle model");
+      assert.deepEqual(textOnly!.input, ["text"], "text-only models should keep a single text input modality");
+
+      const imageCapable = modelById.get("cx/gpt-5.5");
+      assert.ok(imageCapable, "fixture should normalize the GPT 5.5 model");
+      assert.deepEqual(imageCapable!.input, ["text", "image"], "image-capable GPT 5.5 should expose both text and image input modalities");
+      assert.equal(imageCapable!.reasoning, true, "GPT 5.5 should remain reasoning-capable after normalization");
+      assert.deepEqual(
+        imageCapable!.thinkingLevelMap,
+        {
+          minimal: null,
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+        },
+        "GPT 5.5 thinking variants should merge into a single semantic provider entry",
+      );
+      assert.equal(modelById.has("cx/gpt-5.5-low"), false, "thinking variants should merge into the base model instead of appearing separately");
+      assert.equal(modelById.has("cx/gpt-5.5-medium"), false, "thinking variants should merge into the base model instead of appearing separately");
+      assert.equal(modelById.has("cx/gpt-5.5-high"), false, "thinking variants should merge into the base model instead of appearing separately");
+      assert.equal(modelById.has("cx/gpt-5.5-xhigh"), false, "thinking variants should merge into the base model instead of appearing separately");
+      assert.equal(modelById.has("codex/gpt-5.5"), true, "the normalized catalog should keep a single GPT 5.5 entry from the usable text-output variant and drop the image-output duplicate");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("does not leak discovery secrets into cache files or fixture data", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+      startSession(harness, "tui");
+      await server.waitForResponses(1, "secrets check should still exercise the live refresh path");
+      await waitForProviderCount(harness, 2, "secrets check should still exercise the live refresh path");
+
+      const cacheText = await readFile(cachePath, "utf8");
+      assert.equal(cacheText.includes("test-key"), false, "cache should not contain the discovery API key");
+      assert.equal(cacheText.includes("Authorization"), false, "cache should not contain Authorization headers");
+      assert.equal(cacheText.includes("Bearer"), false, "cache should not contain bearer tokens");
+
+      const fixtureText = await readFile(fixturePath, "utf8");
+      assert.equal(/sk-[A-Za-z0-9_-]{8,}/.test(fixtureText), false, "fixture should not contain secret-like API key strings");
+      assert.equal(fixtureText.includes("Authorization"), false, "fixture should not contain Authorization headers");
+      assert.equal(fixtureText.includes("Bearer"), false, "fixture should not contain bearer tokens");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("normalizes trailing slashes in OMNIROUTE_BASE_URL and keeps the normalized cache usable", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "models.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(`${server.baseUrl}/`, cachePath, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+      startSession(harness, "tui");
+      await server.waitForResponses(1, "trailing-slash refresh should finish once and rewrite the cache");
+      await waitForProviderCount(harness, 2, "live refresh should complete before checking the normalized cache");
+
+      const cache = JSON.parse(await readFile(cachePath, "utf8"));
+      assert.equal(cache.baseUrl, server.baseUrl, "refreshed cache should trim the trailing slash from OMNIROUTE_BASE_URL");
+      assert.equal(server.requests, 1, "refresh should still hit the canonical /v1/models endpoint exactly once");
+
+      const nextStartup = createHarness();
+      configureCacheStartup(`${server.baseUrl}/`, cachePath, []);
+      extension(nextStartup.api);
+      assert.equal(nextStartup.registeredProviders.length, 1, "normalized cache should be reusable on the next interactive startup");
+      assert.equal(latestProvider(nextStartup)!.config.baseUrl, server.baseUrl, "subsequent startup should read the normalized baseUrl from cache");
+      assert.ok(latestProvider(nextStartup)!.config.models!.length > 100, "subsequent startup should restore the refreshed live catalog from cache");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("writes the default cache path under PI_CODING_AGENT_DIR when OMNIROUTE_MODEL_CACHE_PATH is unset", async () => {
+    const server = await createFixtureServer();
+    const agentDir = join(tempDir, "agent-dir");
+    try {
+      const seedCachePath = defaultCachePath(server.baseUrl, agentDir);
+      await mkdir(dirname(seedCachePath), { recursive: true });
+      await writeValidCache(seedCachePath, server.baseUrl);
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      configureCacheStartup(`${server.baseUrl}/`, undefined, []);
+
+      const harness = createHarness();
+      extension(harness.api);
+      assert.equal(server.requests, 0, "default cache path startup should stay offline before session_start");
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "default cache path startup should register the cached provider immediately");
+
+      startSession(harness, "tui");
+      await server.waitForResponses(1, "default cache path refresh should complete once and write under the agent dir");
+      await waitForProviderCount(harness, 2, "default cache path refresh should register the live provider");
+
+      const cacheDir = join(agentDir, "omniroute");
+      const cacheFiles = await readdir(cacheDir);
+      assert.equal(cacheFiles.length, 1, "default cache path should create exactly one cache file for the base URL");
+      assert.match(cacheFiles[0]!, /^models-[a-f0-9]{16}\.json$/, "default cache path should hash the normalized base URL into the cache file name");
+
+      const cache = JSON.parse(await readFile(join(cacheDir, cacheFiles[0]!), "utf8"));
+      assert.equal(cache.baseUrl, server.baseUrl, "default cache path should store the normalized baseUrl");
+      assert.ok(cache.models.length > 100, "default cache path should persist the refreshed live model catalog");
+      assert.equal(cache.models.some((model: { id: string }) => model.id === "cached-test-model"), false, "default cache path should not persist the seed cache placeholder");
+
+      const nextStartup = createHarness();
+      configureCacheStartup(`${server.baseUrl}/`, join(cacheDir, cacheFiles[0]!), []);
+      extension(nextStartup.api);
+      assert.equal(nextStartup.registeredProviders.length, 1, "default cache path should be readable on the next startup");
+      assert.equal(latestProvider(nextStartup)!.config.baseUrl, server.baseUrl, "default cache path should preserve the normalized baseUrl");
+      assert.ok(latestProvider(nextStartup)!.config.models!.length > 100, "default cache path should restore the refreshed live catalog");
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+async function waitForProviderCount(harness: ExtensionHarness, target: number, message: string) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (harness.registeredProviders.length >= target) return;
+    await settleAsyncWork();
+  }
+
+  assert.fail(message);
+}

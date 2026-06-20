@@ -5,6 +5,9 @@
   "private": true,
   "keywords": ["pi-package", "pi-extension", "omniroute"],
   "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.ts"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },

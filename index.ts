@@ -1,14 +1,20 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER = "omniroute";
 const PROVIDER_DISPLAY_NAME = "Omniroute";
-const BASE_URL = process.env.OMNIROUTE_BASE_URL?.trim();
 const API_KEY_REFERENCE = "$OMNIROUTE_API_KEY";
 const AUTH_HEADER_PREFIX = "Bearer ";
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;
-const MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 const MAX_ERROR_BODY_LENGTH = 500;
+const CACHE_SCHEMA_VERSION = 1;
+const CACHE_PATH_ENV = "OMNIROUTE_MODEL_CACHE_PATH";
 
 interface OmnirouteModel {
   id: string;
@@ -56,7 +62,27 @@ interface DataPayload<T> {
 
 type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 type ReasoningEffort = ThinkingLevel;
+type ProviderInput = "text" | "image";
 
+interface ProviderModel {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  thinkingLevelMap?: Record<ThinkingLevel, string | null>;
+  compat?: typeof DEEPSEEK_COMPAT;
+  input: ProviderInput[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow: number;
+  maxTokens: number;
+}
+
+interface ModelCache {
+  schemaVersion: typeof CACHE_SCHEMA_VERSION;
+  provider: typeof PROVIDER;
+  baseUrl: string;
+  fetchedAt: string;
+  models: ProviderModel[];
+}
 
 const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
@@ -216,7 +242,7 @@ function getVscodeEffortsForModel(model: OmnirouteModel, effortIndex: VscodeEffo
   return effortIndex.root.get(rootModelKey(model) ?? "") ?? [];
 }
 
-function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]) {
+function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]): ProviderModel {
   const reasoning = Boolean(model.capabilities?.reasoning || model.capabilities?.thinking || levels.length > 0);
   const isDeepseekFamily = model.family === DEEPSEEK_THINKING_FAMILY;
   const thinkingLevelMap = normalizeThinkingLevels(levels, { xhighValue: isDeepseekFamily ? "max" : undefined });
@@ -227,14 +253,14 @@ function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]) {
     reasoning,
     ...(reasoning ? { thinkingLevelMap } : {}),
     ...(reasoning && isDeepseekFamily ? { compat: DEEPSEEK_COMPAT } : {}),
-    input: (model.input_modalities?.includes("image") ? ["text", "image"] : ["text"]) as Array<"text" | "image">,
+    input: (model.input_modalities?.includes("image") ? ["text", "image"] : ["text"]) as ProviderInput[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.context_length ?? model.max_input_tokens ?? DEFAULT_CONTEXT_WINDOW,
     maxTokens: model.max_output_tokens ?? DEFAULT_MAX_TOKENS,
   };
 }
 
-function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortIndex) {
+function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortIndex): ProviderModel[] {
   const deduped = new Map<string, OmnirouteModel>();
   for (const model of rawModels.filter((candidate) => candidate?.id && isTextModel(candidate))) {
     const current = deduped.get(model.id);
@@ -243,7 +269,7 @@ function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortI
 
   const models = [...deduped.entries()].sort(([a], [b]) => a.localeCompare(b));
   const used = new Set<string>();
-  const normalized: ReturnType<typeof toProviderModel>[] = [];
+  const normalized: ProviderModel[] = [];
 
   for (const [id, model] of models) {
     if (used.has(id)) continue;
@@ -301,20 +327,169 @@ function cleanConfigValue(value: string | undefined) {
   return trimmed || undefined;
 }
 
+function expandTilde(value: string) {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/")) return join(homedir(), value.slice(2));
+  return value;
+}
+
+function getAgentDir() {
+  const configured = cleanConfigValue(process.env.PI_CODING_AGENT_DIR);
+  return configured ? expandTilde(configured) : join(homedir(), ".pi", "agent");
+}
+
+function getDiscoveryTimeoutMs() {
+  const configured = Number(process.env.OMNIROUTE_MODEL_DISCOVERY_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS;
+}
+
 function getDiscoveryApiKey() {
   return cleanConfigValue(process.env.OMNIROUTE_API_KEY);
 }
 
 function getBaseUrl() {
-  return cleanConfigValue(BASE_URL);
+  return cleanConfigValue(process.env.OMNIROUTE_BASE_URL)?.replace(/\/+$/, "");
+}
+
+function getCachePath(baseUrl: string) {
+  const configuredPath = cleanConfigValue(process.env[CACHE_PATH_ENV]);
+  if (configuredPath) return configuredPath;
+
+  const cacheKey = createHash("sha256").update(baseUrl).digest("hex").slice(0, 16);
+  return join(getAgentDir(), "omniroute", `models-${cacheKey}.json`);
+}
+
+function isInteractiveStartupProcess() {
+  const args = process.argv.slice(2);
+  if (args.some((arg) => arg === "--list-models" || arg.startsWith("--list-models="))) return false;
+  if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "--print" || arg === "-p")) return false;
+
+  const modeIndex = args.indexOf("--mode");
+  const mode = modeIndex >= 0 ? args[modeIndex + 1] : args.find((arg) => arg.startsWith("--mode="))?.slice("--mode=".length);
+  if (mode === "rpc" || mode === "json") return false;
+
+  return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPositiveNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+function isCost(value: unknown): value is ProviderModel["cost"] {
+  if (!isRecord(value)) return false;
+  return ["input", "output", "cacheRead", "cacheWrite"].every((key) => typeof value[key] === "number" && Number.isFinite(value[key]));
+}
+
+function isInputList(value: unknown): value is ProviderInput[] {
+  return Array.isArray(value) && value.length > 0 && value.every((item) => item === "text" || item === "image");
+}
+
+function isValidThinkingLevelMap(value: unknown): value is Record<ThinkingLevel, string | null> {
+  if (!isRecord(value)) return false;
+
+  for (const [key, entry] of Object.entries(value)) {
+    if (!THINKING_LEVEL_SET.has(key)) return false;
+    if (entry !== null && typeof entry !== "string") return false;
+  }
+
+  return true;
+}
+
+function isProviderModel(value: unknown): value is ProviderModel {
+  if (!isRecord(value)) return false;
+  if (typeof value.id !== "string" || value.id.length === 0) return false;
+  if (typeof value.name !== "string" || value.name.length === 0) return false;
+  if (typeof value.reasoning !== "boolean") return false;
+  if (!isInputList(value.input)) return false;
+  if (!isCost(value.cost)) return false;
+  if (!isPositiveNumber(value.contextWindow)) return false;
+  if (!isPositiveNumber(value.maxTokens)) return false;
+  if (value.thinkingLevelMap !== undefined && !isValidThinkingLevelMap(value.thinkingLevelMap)) return false;
+  return true;
+}
+
+function parseModelCache(value: unknown, baseUrl: string): ModelCache | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.schemaVersion !== CACHE_SCHEMA_VERSION) return undefined;
+  if (value.provider !== PROVIDER) return undefined;
+  if (value.baseUrl !== baseUrl) return undefined;
+  if (typeof value.fetchedAt !== "string" || value.fetchedAt.length === 0) return undefined;
+  if (!Array.isArray(value.models) || value.models.length === 0) return undefined;
+  if (!value.models.every(isProviderModel)) return undefined;
+
+  return value as unknown as ModelCache;
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function errorCode(error: unknown) {
+  return isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+}
+
+function readCachedModels(baseUrl: string): ProviderModel[] {
+  const cachePath = getCachePath(baseUrl);
+
+  try {
+    const cache = parseModelCache(JSON.parse(readFileSync(cachePath, "utf8")), baseUrl);
+    if (!cache) {
+      console.warn(`[${PROVIDER}] Ignoring invalid model cache at ${cachePath}.`);
+      return [];
+    }
+
+    return cache.models;
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") {
+      console.warn(`[${PROVIDER}] Could not read model cache at ${cachePath}: ${errorMessage(error)}`);
+    }
+
+    return [];
+  }
+}
+
+async function writeModelCache(baseUrl: string, models: ProviderModel[]) {
+  const cachePath = getCachePath(baseUrl);
+  const cache: ModelCache = {
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    provider: PROVIDER,
+    baseUrl,
+    fetchedAt: new Date().toISOString(),
+    models,
+  };
+
+  await mkdir(dirname(cachePath), { recursive: true, mode: 0o700 });
+
+  const tempPath = `${cachePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(cache, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(tempPath, cachePath);
+}
+
+function registerOmnirouteProvider(pi: ExtensionAPI, baseUrl: string, models: ProviderModel[]) {
+  if (models.length === 0) return false;
+
+  pi.registerProvider(PROVIDER, {
+    name: PROVIDER_DISPLAY_NAME,
+    baseUrl,
+    apiKey: API_KEY_REFERENCE,
+    api: "openai-completions",
+    models,
+  });
+
+  return true;
 }
 
 async function responseErrorSummary(response: Response) {
+  const status = `Model discovery failed: ${response.status} ${response.statusText}`.trim();
   const body = (await response.text()).trim();
-  if (!body) return `Model discovery failed: ${response.status}`;
+  if (!body) return status;
 
   const summary = body.length > MAX_ERROR_BODY_LENGTH ? `${body.slice(0, MAX_ERROR_BODY_LENGTH)}…` : body;
-  return `Model discovery failed: ${response.status} ${summary}`;
+  return `${status}: ${summary}`;
 }
 
 async function discoverModels() {
@@ -326,7 +501,7 @@ async function discoverModels() {
 
   const headers = { Authorization: `${AUTH_HEADER_PREFIX}${apiKey}` };
   const timeoutSignal = new AbortController();
-  const timeout = setTimeout(() => timeoutSignal.abort(), MODEL_DISCOVERY_TIMEOUT_MS);
+  const timeout = setTimeout(() => timeoutSignal.abort(), getDiscoveryTimeoutMs());
 
   try {
     const mainResponse = await fetch(`${baseUrl}/models`, {
@@ -370,8 +545,8 @@ async function discoverModels() {
     throw new Error("Model discovery returned no usable text models");
   } catch (error) {
     console.warn(
-      `[${PROVIDER}] Model discovery failed; skipping provider registration.`,
-      error instanceof Error ? error.message : error,
+      `[${PROVIDER}] Model discovery failed; keeping the existing cached provider if available.`,
+      errorMessage(error),
     );
     return [];
   } finally {
@@ -379,22 +554,40 @@ async function discoverModels() {
   }
 }
 
-export default async function (pi: ExtensionAPI) {
-  const models = await discoverModels();
-  if (models.length === 0) {
-    return;
-  }
-
+async function refreshModelsAndUpdateProvider(pi: ExtensionAPI) {
   const baseUrl = getBaseUrl();
-  if (!baseUrl) {
-    return;
+  if (!baseUrl || !getDiscoveryApiKey()) return;
+
+  const models = await discoverModels();
+  if (models.length === 0) return;
+
+  try {
+    await writeModelCache(baseUrl, models);
+  } catch (error) {
+    console.warn(`[${PROVIDER}] Model discovery succeeded but cache write failed: ${errorMessage(error)}`);
   }
 
-  pi.registerProvider(PROVIDER, {
-    name: PROVIDER_DISPLAY_NAME,
-    baseUrl,
-    apiKey: API_KEY_REFERENCE,
-    api: "openai-completions",
-    models,
+  registerOmnirouteProvider(pi, baseUrl, models);
+}
+
+export default function (pi: ExtensionAPI) {
+  const baseUrl = getBaseUrl();
+  const useInteractiveStartupCache = isInteractiveStartupProcess();
+  if (baseUrl && useInteractiveStartupCache) {
+    registerOmnirouteProvider(pi, baseUrl, readCachedModels(baseUrl));
+  }
+
+  let refreshInFlight: Promise<void> | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    if (refreshInFlight) return;
+
+    refreshInFlight = refreshModelsAndUpdateProvider(pi)
+      .catch((error) => {
+        console.warn(`[${PROVIDER}] Model discovery succeeded but provider update failed: ${errorMessage(error)}`);
+      })
+      .finally(() => {
+        refreshInFlight = undefined;
+      });
   });
 }
