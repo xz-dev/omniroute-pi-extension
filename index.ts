@@ -359,13 +359,9 @@ function getCachePath(baseUrl: string) {
   return join(getAgentDir(), "omniroute", `models-${cacheKey}.json`);
 }
 
-function isListModelsProcess() {
-  return process.argv.slice(2).some((arg) => arg === "--list-models" || arg.startsWith("--list-models="));
-}
-
-function isInteractiveStartupProcess() {
+function shouldBootstrapModels() {
   const args = process.argv.slice(2);
-  if (isListModelsProcess()) return false;
+  if (args.some((arg) => arg === "--list-models" || arg.startsWith("--list-models="))) return true;
   if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "--print" || arg === "-p")) return false;
 
   const modeIndex = args.indexOf("--mode");
@@ -566,20 +562,16 @@ async function refreshCacheFromDiscovery(baseUrl: string) {
     await writeModelCache(baseUrl, models);
   } catch (error) {
     console.warn(`[${PROVIDER}] Model discovery succeeded but cache write failed: ${errorMessage(error)}`);
-    return models;
   }
 
-  const cachedModels = readCachedModels(baseUrl);
-  if (cachedModels.length === 0) return models;
-
-  return cachedModels;
+  return models;
 }
 
 async function refreshModelsAndUpdateProvider(pi: ExtensionAPI, baseUrl: string) {
-  const cachedModels = await refreshCacheFromDiscovery(baseUrl);
-  if (cachedModels.length === 0) return;
+  const models = await refreshCacheFromDiscovery(baseUrl);
+  if (models.length === 0) return;
 
-  registerOmnirouteProvider(pi, baseUrl, cachedModels);
+  registerOmnirouteProvider(pi, baseUrl, models);
 }
 
 function warnProviderUpdateFailure(error: unknown) {
@@ -626,7 +618,7 @@ export default async function (pi: ExtensionAPI) {
     void scheduleRefresh();
   });
 
-  if (isListModelsProcess() || isInteractiveStartupProcess()) {
+  if (shouldBootstrapModels()) {
     await bootstrapModels(pi, baseUrl, scheduleRefresh);
   }
 }

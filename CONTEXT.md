@@ -21,5 +21,5 @@ A best-effort attempt to fetch the current Model Catalog from OmniRoute and repl
 _Avoid_: blocking discovery, forced reload
 
 **Interactive Session Startup**:
-Startup of a Pi TUI session. This is the only startup path that uses the Model Catalog Cache.
-_Avoid_: metadata command, `pi --list-models` startup, print startup, RPC startup
+Startup of a Pi TUI session. This path uses the Model Catalog Cache immediately, then refreshes in the background. `pi --list-models` follows the same cache-first bootstrap behavior.
+_Avoid_: print startup, RPC startup
