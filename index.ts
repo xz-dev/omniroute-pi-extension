@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER = "omniroute";
-const PROVIDER_DISPLAY_NAME = "Omniroute";
+const PROVIDER_DISPLAY_NAME = "OmniRoute";
 const API_KEY_REFERENCE = "$OMNIROUTE_API_KEY";
 const AUTH_HEADER_PREFIX = "Bearer ";
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -396,14 +396,13 @@ function isOfflineMode() {
   return isTruthyEnvFlag(process.env.PI_OFFLINE);
 }
 
-function shouldBootstrapModels() {
-  return !hasHelpArg();
+function shouldBootstrapModels(args: string[]) {
+  return !hasHelpArg(args);
 }
 
-function shouldRefreshAfterCachedBootstrap() {
+function shouldRefreshAfterCachedBootstrap(args: string[]) {
   if (isOfflineMode()) return false;
 
-  const args = getProcessArgs();
   return hasListModelsArg(args) || isInteractiveTuiStartup(args);
 }
 
@@ -638,6 +637,8 @@ export default async function (pi: ExtensionAPI) {
   const baseUrl = getBaseUrl();
   if (!baseUrl) return;
 
+  const args = getProcessArgs();
+
   let refreshInFlight: Promise<void> | undefined;
   const scheduleRefresh = () => {
     if (refreshInFlight) return refreshInFlight;
@@ -657,12 +658,12 @@ export default async function (pi: ExtensionAPI) {
     void scheduleRefresh();
   });
 
-  if (shouldBootstrapModels()) {
+  if (shouldBootstrapModels(args)) {
     await bootstrapModels(
       pi,
       baseUrl,
       {
-        refreshAfterCacheHit: shouldRefreshAfterCachedBootstrap(),
+        refreshAfterCacheHit: shouldRefreshAfterCachedBootstrap(args),
         refreshWhenCacheMissing: !isOfflineMode(),
       },
       scheduleRefresh,

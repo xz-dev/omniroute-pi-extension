@@ -1,8 +1,9 @@
 {
   "name": "omniroute-pi-extension",
   "version": "0.1.0",
-  "description": "Omniroute custom provider extension for pi.",
+  "description": "OmniRoute custom provider extension for Pi.",
   "private": true,
+  "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "omniroute"],
   "type": "module",
   "scripts": {

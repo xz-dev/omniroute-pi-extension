@@ -4,7 +4,7 @@ This document records the runtime features and invariants implemented by the Omn
 
 ## Provider registration
 
-- Registers a Pi model provider named `omniroute` with display name `Omniroute`.
+- Registers a Pi model provider named `omniroute` with display name `OmniRoute`.
 - Uses Pi's built-in `openai-completions` provider API implementation.
 - Sends requests to `OMNIROUTE_BASE_URL` and uses the literal Pi config reference `$OMNIROUTE_API_KEY` for request authentication.
 - Registers the provider in every non-metadata Pi startup path where models can be used:
