@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -359,9 +359,13 @@ function getCachePath(baseUrl: string) {
   return join(getAgentDir(), "omniroute", `models-${cacheKey}.json`);
 }
 
+function isListModelsProcess() {
+  return process.argv.slice(2).some((arg) => arg === "--list-models" || arg.startsWith("--list-models="));
+}
+
 function isInteractiveStartupProcess() {
   const args = process.argv.slice(2);
-  if (args.some((arg) => arg === "--list-models" || arg.startsWith("--list-models="))) return false;
+  if (isListModelsProcess()) return false;
   if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "--print" || arg === "-p")) return false;
 
   const modeIndex = args.indexOf("--mode");
@@ -570,11 +574,25 @@ async function refreshModelsAndUpdateProvider(pi: ExtensionAPI) {
   registerOmnirouteProvider(pi, baseUrl, models);
 }
 
-export default function (pi: ExtensionAPI) {
+function warnProviderUpdateFailure(error: unknown) {
+  console.warn(`[${PROVIDER}] Model discovery succeeded but provider update failed: ${errorMessage(error)}`);
+}
+
+export default async function (pi: ExtensionAPI) {
   const baseUrl = getBaseUrl();
+
+  if (baseUrl && isListModelsProcess()) {
+    registerOmnirouteProvider(pi, baseUrl, await discoverModels());
+    return;
+  }
+
   const useInteractiveStartupCache = isInteractiveStartupProcess();
   if (baseUrl && useInteractiveStartupCache) {
-    registerOmnirouteProvider(pi, baseUrl, readCachedModels(baseUrl));
+    const cachePath = getCachePath(baseUrl);
+    const cachedModels = readCachedModels(baseUrl);
+    if (!registerOmnirouteProvider(pi, baseUrl, cachedModels) && !existsSync(cachePath)) {
+      await refreshModelsAndUpdateProvider(pi).catch(warnProviderUpdateFailure);
+    }
   }
 
   let refreshInFlight: Promise<void> | undefined;
@@ -583,9 +601,7 @@ export default function (pi: ExtensionAPI) {
     if (refreshInFlight) return;
 
     refreshInFlight = refreshModelsAndUpdateProvider(pi)
-      .catch((error) => {
-        console.warn(`[${PROVIDER}] Model discovery succeeded but provider update failed: ${errorMessage(error)}`);
-      })
+      .catch(warnProviderUpdateFailure)
       .finally(() => {
         refreshInFlight = undefined;
       });

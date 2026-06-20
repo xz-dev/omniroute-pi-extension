@@ -304,7 +304,7 @@ function configureCacheStartup(baseUrl: string, cachePath: string | undefined, a
 }
 
 describe("OmniRoute model catalog cache", () => {
-  it("uses cache only for interactive startup, not --list-models", async () => {
+  it("uses cache only for interactive startup, while --list-models performs live discovery without cache", async () => {
     const server = await createFixtureServer();
     try {
       const cachePath = join(tempDir, "models.json");
@@ -312,15 +312,17 @@ describe("OmniRoute model catalog cache", () => {
       configureCacheStartup(server.baseUrl, cachePath);
 
       const interactive = createHarness();
-      extension(interactive.api);
+      await extension(interactive.api);
       assert.equal(server.requests, 0, "interactive startup should not hit live discovery before session_start");
       assert.deepEqual(modelIds(latestProvider(interactive)), ["cached-test-model"], "interactive TUI startup should register the cached provider immediately");
       assert.equal(latestProvider(interactive)!.config.apiKey, "$OMNIROUTE_API_KEY", "cached startup should keep the literal discovery key reference");
 
       const listModels = createHarness();
       configureCacheStartup(server.baseUrl, cachePath, ["--list-models"]);
-      extension(listModels.api);
-      assert.equal(listModels.registeredProviders.length, 0, "--list-models should not use the startup cache path");
+      await extension(listModels.api);
+      assert.equal(server.requests, 1, "--list-models should bypass startup cache and discover models live");
+      assert.ok(latestProvider(listModels)!.config.models!.length > 100, "--list-models should register the live discovered model catalog");
+      assert.equal(modelIds(latestProvider(listModels)).includes("cached-test-model"), false, "--list-models should not register cached placeholder models");
     } finally {
       await server.close();
     }
@@ -455,6 +457,27 @@ describe("OmniRoute model catalog cache", () => {
       startSession(harness, "tui");
       await expectCountToStayStable(() => server.requests, 0, 100, "missing API key should prevent TUI refresh from hitting live discovery");
       assert.equal(await readFile(cachePath, "utf8"), originalCache, "missing API key should not rewrite the cache");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("initializes the cache synchronously on the first interactive startup when no cache exists", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cachePath = join(tempDir, "first-startup.json");
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      await extension(harness.api);
+
+      assert.equal(server.requests, 1, "first interactive startup without a cache should discover models live once");
+      assert.ok(latestProvider(harness)!.config.models!.length > 100, "first startup should register the live discovered model catalog");
+      assert.equal(modelIds(latestProvider(harness)).includes("cached-test-model"), false, "first startup should not invent cached placeholder models");
+
+      const cache = JSON.parse(await readFile(cachePath, "utf8"));
+      assert.equal(cache.baseUrl, server.baseUrl, "first startup should write a normalized cache for future cache-first starts");
+      assert.ok(cache.models.length > 100, "first startup should persist the live model catalog");
     } finally {
       await server.close();
     }
