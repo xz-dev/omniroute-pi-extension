@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -558,52 +558,75 @@ async function discoverModels() {
   }
 }
 
-async function refreshModelsAndUpdateProvider(pi: ExtensionAPI) {
-  const baseUrl = getBaseUrl();
-  if (!baseUrl || !getDiscoveryApiKey()) return;
-
+async function refreshCacheFromDiscovery(baseUrl: string) {
   const models = await discoverModels();
-  if (models.length === 0) return;
+  if (models.length === 0) return [];
 
   try {
     await writeModelCache(baseUrl, models);
   } catch (error) {
     console.warn(`[${PROVIDER}] Model discovery succeeded but cache write failed: ${errorMessage(error)}`);
+    return models;
   }
 
-  registerOmnirouteProvider(pi, baseUrl, models);
+  const cachedModels = readCachedModels(baseUrl);
+  if (cachedModels.length === 0) return models;
+
+  return cachedModels;
+}
+
+async function refreshModelsAndUpdateProvider(pi: ExtensionAPI, baseUrl: string) {
+  const cachedModels = await refreshCacheFromDiscovery(baseUrl);
+  if (cachedModels.length === 0) return;
+
+  registerOmnirouteProvider(pi, baseUrl, cachedModels);
 }
 
 function warnProviderUpdateFailure(error: unknown) {
   console.warn(`[${PROVIDER}] Model discovery succeeded but provider update failed: ${errorMessage(error)}`);
 }
 
-export default async function (pi: ExtensionAPI) {
-  const baseUrl = getBaseUrl();
-
-  if (baseUrl && isListModelsProcess()) {
-    registerOmnirouteProvider(pi, baseUrl, await discoverModels());
+async function bootstrapModels(
+  pi: ExtensionAPI,
+  baseUrl: string,
+  scheduleRefresh: () => Promise<void> | undefined,
+) {
+  const cachedModels = readCachedModels(baseUrl);
+  if (cachedModels.length > 0) {
+    registerOmnirouteProvider(pi, baseUrl, cachedModels);
+    void scheduleRefresh();
     return;
   }
 
-  const useInteractiveStartupCache = isInteractiveStartupProcess();
-  if (baseUrl && useInteractiveStartupCache) {
-    const cachePath = getCachePath(baseUrl);
-    const cachedModels = readCachedModels(baseUrl);
-    if (!registerOmnirouteProvider(pi, baseUrl, cachedModels) && !existsSync(cachePath)) {
-      await refreshModelsAndUpdateProvider(pi).catch(warnProviderUpdateFailure);
-    }
-  }
+  const refresh = scheduleRefresh();
+  if (!refresh) return;
+  await refresh;
+}
+
+export default async function (pi: ExtensionAPI) {
+  const baseUrl = getBaseUrl();
+  if (!baseUrl) return;
 
   let refreshInFlight: Promise<void> | undefined;
-  pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
-    if (refreshInFlight) return;
+  const scheduleRefresh = () => {
+    if (refreshInFlight) return refreshInFlight;
+    if (!getDiscoveryApiKey()) return undefined;
 
-    refreshInFlight = refreshModelsAndUpdateProvider(pi)
+    refreshInFlight = refreshModelsAndUpdateProvider(pi, baseUrl)
       .catch(warnProviderUpdateFailure)
       .finally(() => {
         refreshInFlight = undefined;
       });
+
+    return refreshInFlight;
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    void scheduleRefresh();
   });
+
+  if (isListModelsProcess() || isInteractiveStartupProcess()) {
+    await bootstrapModels(pi, baseUrl, scheduleRefresh);
+  }
 }
