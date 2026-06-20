@@ -359,16 +359,52 @@ function getCachePath(baseUrl: string) {
   return join(getAgentDir(), "omniroute", `models-${cacheKey}.json`);
 }
 
-function shouldBootstrapModels() {
-  const args = process.argv.slice(2);
-  if (args.some((arg) => arg === "--list-models" || arg.startsWith("--list-models="))) return true;
-  if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "--print" || arg === "-p")) return false;
+function getProcessArgs() {
+  return process.argv.slice(2);
+}
 
+function hasHelpArg(args = getProcessArgs()) {
+  return args.some((arg) => arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v");
+}
+
+function hasListModelsArg(args = getProcessArgs()) {
+  return args.some((arg) => arg === "--list-models" || arg.startsWith("--list-models="));
+}
+
+function getModeArg(args = getProcessArgs()) {
   const modeIndex = args.indexOf("--mode");
-  const mode = modeIndex >= 0 ? args[modeIndex + 1] : args.find((arg) => arg.startsWith("--mode="))?.slice("--mode=".length);
-  if (mode === "rpc" || mode === "json") return false;
+  return modeIndex >= 0 ? args[modeIndex + 1] : args.find((arg) => arg.startsWith("--mode="))?.slice("--mode=".length);
+}
 
+function isPrintArg(args = getProcessArgs()) {
+  return args.some((arg) => arg === "--print" || arg === "-p");
+}
+
+function isInteractiveTuiStartup(args = getProcessArgs()) {
+  const mode = getModeArg(args);
+  if (mode === "rpc" || mode === "json" || isPrintArg(args)) return false;
   return process.stdin.isTTY === true && process.stdout.isTTY === true;
+}
+
+function isTruthyEnvFlag(value: string | undefined) {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+function isOfflineMode() {
+  return isTruthyEnvFlag(process.env.PI_OFFLINE);
+}
+
+function shouldBootstrapModels() {
+  return !hasHelpArg();
+}
+
+function shouldRefreshAfterCachedBootstrap() {
+  if (isOfflineMode()) return false;
+
+  const args = getProcessArgs();
+  return hasListModelsArg(args) || isInteractiveTuiStartup(args);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -581,14 +617,17 @@ function warnProviderUpdateFailure(error: unknown) {
 async function bootstrapModels(
   pi: ExtensionAPI,
   baseUrl: string,
+  options: { refreshAfterCacheHit: boolean; refreshWhenCacheMissing: boolean },
   scheduleRefresh: () => Promise<void> | undefined,
 ) {
   const cachedModels = readCachedModels(baseUrl);
   if (cachedModels.length > 0) {
     registerOmnirouteProvider(pi, baseUrl, cachedModels);
-    void scheduleRefresh();
+    if (options.refreshAfterCacheHit) void scheduleRefresh();
     return;
   }
+
+  if (!options.refreshWhenCacheMissing) return;
 
   const refresh = scheduleRefresh();
   if (!refresh) return;
@@ -614,11 +653,19 @@ export default async function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
+    if (ctx.mode !== "tui" || isOfflineMode()) return;
     void scheduleRefresh();
   });
 
   if (shouldBootstrapModels()) {
-    await bootstrapModels(pi, baseUrl, scheduleRefresh);
+    await bootstrapModels(
+      pi,
+      baseUrl,
+      {
+        refreshAfterCacheHit: shouldRefreshAfterCachedBootstrap(),
+        refreshWhenCacheMissing: !isOfflineMode(),
+      },
+      scheduleRefresh,
+    );
   }
 }

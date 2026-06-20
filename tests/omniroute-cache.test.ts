@@ -351,16 +351,14 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
-  it("does not register cached models for non-interactive startup modes", async () => {
+  it("does not register cached models for metadata-only startup modes", async () => {
     const server = await createFixtureServer();
     try {
       const cases = [
         { name: "--help", argv: ["--help"] },
         { name: "-h", argv: ["-h"] },
-        { name: "--print", argv: ["--print"] },
-        { name: "-p", argv: ["-p"] },
-        { name: "--mode rpc", argv: ["--mode", "rpc"] },
-        { name: "--mode=json", argv: ["--mode=json"] },
+        { name: "--version", argv: ["--version"] },
+        { name: "-v", argv: ["-v"] },
       ] as const;
 
       for (const testCase of cases) {
@@ -369,33 +367,38 @@ describe("OmniRoute model catalog cache", () => {
         configureCacheStartup(server.baseUrl, cachePath, [...testCase.argv]);
 
         const harness = createHarness();
-        assert.doesNotThrow(() => extension(harness.api), `${testCase.name} startup should not throw`);
-        assert.equal(server.requests, 0, `${testCase.name} should not hit live discovery before session_start`);
-        assert.equal(harness.registeredProviders.length, 0, `${testCase.name} should skip cached model registration`);
+        await assert.doesNotReject(() => extension(harness.api), `${testCase.name} startup should not throw`);
+        assert.equal(server.requests, 0, `${testCase.name} should not hit live discovery`);
+        assert.equal(harness.registeredProviders.length, 0, `${testCase.name} should skip model registration`);
       }
     } finally {
       await server.close();
     }
   });
 
-  it("does not register cached models when stdin or stdout is not a TTY", async () => {
+  it("registers cached models for headless startup modes without refreshing", async () => {
     const server = await createFixtureServer();
     try {
       const cases = [
-        { name: "stdin non-TTY", stdinTTY: false, stdoutTTY: true },
-        { name: "stdout non-TTY", stdinTTY: true, stdoutTTY: false },
+        { name: "--print", argv: ["--print"], stdinTTY: true, stdoutTTY: true },
+        { name: "-p", argv: ["-p"], stdinTTY: true, stdoutTTY: true },
+        { name: "--mode rpc", argv: ["--mode", "rpc"], stdinTTY: true, stdoutTTY: true },
+        { name: "--mode=json", argv: ["--mode=json"], stdinTTY: true, stdoutTTY: true },
+        { name: "stdin non-TTY", argv: [], stdinTTY: false, stdoutTTY: true },
+        { name: "stdout non-TTY", argv: [], stdinTTY: true, stdoutTTY: false },
       ] as const;
 
       for (const testCase of cases) {
         const cachePath = join(tempDir, `${testCase.name.replace(/[^a-z0-9]+/gi, "-")}.json`);
         await writeValidCache(cachePath, server.baseUrl);
-        configureCacheStartup(server.baseUrl, cachePath, []);
+        configureCacheStartup(server.baseUrl, cachePath, [...testCase.argv]);
         setTTY(testCase.stdinTTY, testCase.stdoutTTY);
 
         const harness = createHarness();
-        extension(harness.api);
-        assert.equal(server.requests, 0, `${testCase.name} should not use the cache or hit live discovery`);
-        assert.equal(harness.registeredProviders.length, 0, `${testCase.name} should not use the cache`);
+        await extension(harness.api);
+        assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], `${testCase.name} should register cached models during startup`);
+        assert.equal(latestProvider(harness)!.config.apiKey, "$OMNIROUTE_API_KEY", `${testCase.name} should keep the literal discovery key reference`);
+        await expectCountToStayStable(() => server.requests, 0, 100, `${testCase.name} should not refresh cached models in the background`);
       }
     } finally {
       await server.close();
@@ -549,6 +552,63 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
+  it("falls back to blocking discovery for headless startup when no valid cache exists", async () => {
+    const server = await createFixtureServer();
+    try {
+      const cases = [
+        { name: "--print", argv: ["--print"], stdinTTY: true, stdoutTTY: true },
+        { name: "--mode rpc", argv: ["--mode", "rpc"], stdinTTY: true, stdoutTTY: true },
+        { name: "--mode=json", argv: ["--mode=json"], stdinTTY: true, stdoutTTY: true },
+        { name: "stdin non-TTY", argv: [], stdinTTY: false, stdoutTTY: true },
+      ] as const;
+
+      for (const testCase of cases) {
+        const cachePath = join(tempDir, `${testCase.name.replace(/[^a-z0-9]+/gi, "-")}-missing-cache.json`);
+        configureCacheStartup(server.baseUrl, cachePath, [...testCase.argv]);
+        setTTY(testCase.stdinTTY, testCase.stdoutTTY);
+
+        const beforeRequests = server.requests;
+        const harness = createHarness();
+        await extension(harness.api);
+
+        assert.equal(server.requests, beforeRequests + 1, `${testCase.name} should perform one live discovery request when no cache exists`);
+        assert.ok(latestProvider(harness)!.config.models!.length > 100, `${testCase.name} should register the live discovered model catalog`);
+        assert.equal(modelIds(latestProvider(harness)).includes("cached-test-model"), false, `${testCase.name} should not invent cached placeholder models`);
+
+        const cache = JSON.parse(await readFile(cachePath, "utf8"));
+        assert.equal(cache.baseUrl, server.baseUrl, `${testCase.name} should write a normalized cache for future cache-first starts`);
+        assert.ok(cache.models.length > 100, `${testCase.name} should persist the live model catalog`);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("honors offline mode by using cached models without refreshing or discovering", async () => {
+    const server = await createFixtureServer();
+    try {
+      process.env.PI_OFFLINE = "1";
+      const cachePath = join(tempDir, "offline-cache.json");
+      await writeValidCache(cachePath, server.baseUrl);
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      await extension(harness.api);
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "offline startup should still register cached models");
+      startSession(harness, "tui");
+      await expectCountToStayStable(() => server.requests, 0, 100, "offline startup/session_start should not hit live discovery");
+
+      const noCachePath = join(tempDir, "offline-missing-cache.json");
+      configureCacheStartup(server.baseUrl, noCachePath, []);
+      const noCacheHarness = createHarness();
+      await extension(noCacheHarness.api);
+      assert.equal(noCacheHarness.registeredProviders.length, 0, "offline no-cache startup should not register a provider");
+      await expectCountToStayStable(() => server.requests, 0, 100, "offline no-cache startup should not discover live models");
+    } finally {
+      await server.close();
+    }
+  });
+
   it("uses cache-hit startup refresh and lets TUI session_start reuse the in-flight request", async () => {
     const server = await createFixtureServer();
     try {
@@ -684,17 +744,17 @@ describe("OmniRoute model catalog cache", () => {
       configureCacheStartup(server.baseUrl, cachePath, []);
 
       const harness = createHarness();
+      configureCacheStartup(server.baseUrl, cachePath, ["--mode", "rpc"]);
       await extension(harness.api);
-      await server.waitForResponses(1, "startup cache-hit refresh should complete before testing non-TUI session_start");
-      await waitForProviderCount(harness, 2, "startup cache-hit refresh should replace the cached provider before non-TUI session_start");
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "RPC startup should register the cached provider immediately");
 
-      const cacheAfterStartupRefresh = await readFile(cachePath, "utf8");
+      const cacheAfterStartup = await readFile(cachePath, "utf8");
       startSession(harness, "rpc");
       startSession(harness, "json");
 
-      await expectCountToStayStable(() => server.requests, 1, 100, "non-TUI session_start should not trigger another live /models discovery");
-      assert.equal(await readFile(cachePath, "utf8"), cacheAfterStartupRefresh, "non-TUI session_start should not rewrite the cache after the startup refresh");
-      assert.ok(latestProvider(harness)!.config.models!.length > 100, "non-TUI session_start should keep the refreshed live provider intact");
+      await expectCountToStayStable(() => server.requests, 0, 100, "non-TUI startup/session_start should not trigger live /models discovery");
+      assert.equal(await readFile(cachePath, "utf8"), cacheAfterStartup, "non-TUI session_start should not rewrite the cache");
+      assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "non-TUI session_start should keep the cached provider intact");
     } finally {
       await server.close();
     }
