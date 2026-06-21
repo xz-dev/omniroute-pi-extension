@@ -35,6 +35,7 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<first 16 hex chars of sha2
 ## Model Catalog Cache
 
 The Model Catalog Cache is a local JSON snapshot of normalized OmniRoute models.
+When a valid cache exists, it lets Pi Coding Agent interactive startup keep using OmniRoute models instead of quietly falling back to another logged-in provider/model when discovery is slow or unavailable; that fallback can be hidden from users and may lead to unexpected extra cost.
 
 Cache entries include:
 

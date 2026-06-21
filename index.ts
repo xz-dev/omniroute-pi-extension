@@ -521,10 +521,9 @@ async function responseErrorSummary(response: Response) {
   return `${status}: ${summary}`;
 }
 
-async function discoverModels() {
+async function discoverModels(baseUrl: string) {
   const apiKey = getDiscoveryApiKey();
-  const baseUrl = getBaseUrl();
-  if (!apiKey || !baseUrl) {
+  if (!apiKey) {
     return [];
   }
 
@@ -584,7 +583,7 @@ async function discoverModels() {
 }
 
 async function refreshCacheFromDiscovery(baseUrl: string) {
-  const models = await discoverModels();
+  const models = await discoverModels(baseUrl);
   if (models.length === 0) return [];
 
   try {

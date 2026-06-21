@@ -11,9 +11,10 @@ pi install git:github.com/xz-dev/omniroute-pi-extension
 ## What it does
 
 - Reads `OMNIROUTE_BASE_URL` and `OMNIROUTE_API_KEY`.
-- Registers cached models immediately when a valid model catalog cache exists.
+- Registers cached models immediately when a valid Model Catalog Cache exists.
 - Falls back to live discovery when needed.
-- Writes the normalized model catalog cache under `PI_CODING_AGENT_DIR` unless `OMNIROUTE_MODEL_CACHE_PATH` is set.
+- Writes the normalized Model Catalog Cache under `PI_CODING_AGENT_DIR` unless `OMNIROUTE_MODEL_CACHE_PATH` is set.
+- When a valid Model Catalog Cache exists, keeps Pi Coding Agent interactive startup from silently falling back to another logged-in provider/model when OmniRoute live discovery is slow or unavailable, which can be hidden from users and may cause unexpected extra cost.
 
 ## Configuration
 
