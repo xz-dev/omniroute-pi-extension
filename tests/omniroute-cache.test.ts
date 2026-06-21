@@ -413,6 +413,7 @@ describe("OmniRoute model catalog cache", () => {
         { name: "--mode=json", argv: ["--mode=json"], stdinTTY: true, stdoutTTY: true },
         { name: "stdin non-TTY", argv: [], stdinTTY: false, stdoutTTY: true },
         { name: "stdout non-TTY", argv: [], stdinTTY: true, stdoutTTY: false },
+        { name: "SDK/subagent worker stdio", argv: [], stdinTTY: false, stdoutTTY: false },
       ] as const;
 
       for (const testCase of cases) {
@@ -584,9 +585,12 @@ describe("OmniRoute model catalog cache", () => {
     try {
       const cases = [
         { name: "--print", argv: ["--print"], stdinTTY: true, stdoutTTY: true },
+        { name: "-p", argv: ["-p"], stdinTTY: true, stdoutTTY: true },
         { name: "--mode rpc", argv: ["--mode", "rpc"], stdinTTY: true, stdoutTTY: true },
         { name: "--mode=json", argv: ["--mode=json"], stdinTTY: true, stdoutTTY: true },
         { name: "stdin non-TTY", argv: [], stdinTTY: false, stdoutTTY: true },
+        { name: "stdout non-TTY", argv: [], stdinTTY: true, stdoutTTY: false },
+        { name: "SDK/subagent worker stdio", argv: [], stdinTTY: false, stdoutTTY: false },
       ] as const;
 
       for (const testCase of cases) {
@@ -787,7 +791,7 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
-  it("keeps cached provider and cache when discovery returns invalid payloads", async () => {
+  it("keeps cached provider and cache when discovery does not return a usable live catalog", async () => {
     const fixtureModels = await readFixtureModels();
     const imageOnlyModel = fixtureModels.find((model) => model.id === "codex/gpt-5.5" && model.type === "image");
     assert.ok(imageOnlyModel, "fixture should include the unusable image-output codex/gpt-5.5 variant");
@@ -797,14 +801,15 @@ describe("OmniRoute model catalog cache", () => {
       "image-output codex/gpt-5.5 should be unusable for text discovery",
     );
 
-    const payloadCases = [
+    const payloadCases: Array<{ name: string; body: string; status?: number }> = [
+      { name: "HTTP 503", status: 503, body: "service unavailable" },
       { name: "invalid JSON", body: "{\"data\": [" },
       { name: "empty data array", body: JSON.stringify({ data: [] }) },
       { name: "unusable non-text payload", body: JSON.stringify({ data: [imageOnlyModel] }) },
-    ] as const;
+    ];
 
     for (const payloadCase of payloadCases) {
-      const server = await createFixtureServer({ body: payloadCase.body });
+      const server = await createFixtureServer({ status: payloadCase.status, body: payloadCase.body });
       try {
         const cachePath = join(tempDir, `${payloadCase.name.replace(/[^a-z0-9]+/gi, "-")}.json`);
         await writeValidCache(cachePath, server.baseUrl);
@@ -821,10 +826,10 @@ describe("OmniRoute model catalog cache", () => {
 
           assert.equal(server.requests, 1, `${payloadCase.name} should still be attempted exactly once`);
           assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], `${payloadCase.name} should leave the cached provider unchanged`);
-          assert.equal(await readFile(cachePath, "utf8"), originalCache, `${payloadCase.name} should not rewrite the cache on invalid discovery`);
+          assert.equal(await readFile(cachePath, "utf8"), originalCache, `${payloadCase.name} should not rewrite the cache unless discovery returns a usable live catalog`);
         });
 
-        assert.ok(warns.some((line) => line.includes("Model discovery failed") || line.includes("Ignoring invalid model cache")), `${payloadCase.name} should emit an expected warning`);
+        assert.ok(warns.some((line) => line.includes("Model discovery failed")), `${payloadCase.name} should warn about live discovery failure`);
       } finally {
         await server.close();
       }

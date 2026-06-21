@@ -141,7 +141,7 @@ The test suite covers:
 - cache write failures;
 - refresh coalescing;
 - TUI-only `session_start` refresh;
-- preserving cached provider when live discovery returns invalid payloads;
+- preserving cached provider/cache when live discovery fails or returns no usable live catalog;
 - real fixture model normalization;
 - successful supplemental reasoning-effort metadata merging;
 - provider config shape assertions (`name`, `api`, and literal `apiKey` reference);
