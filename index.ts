@@ -396,10 +396,6 @@ function isOfflineMode() {
   return isTruthyEnvFlag(process.env.PI_OFFLINE);
 }
 
-function shouldBootstrapModels(args: string[]) {
-  return !hasHelpArg(args);
-}
-
 function shouldRefreshAfterCachedBootstrap(args: string[]) {
   if (isOfflineMode()) return false;
 
@@ -505,7 +501,7 @@ async function writeModelCache(baseUrl: string, models: ProviderModel[]) {
 }
 
 function registerOmnirouteProvider(pi: ExtensionAPI, baseUrl: string, models: ProviderModel[]) {
-  if (models.length === 0) return false;
+  if (models.length === 0) return;
 
   pi.registerProvider(PROVIDER, {
     name: PROVIDER_DISPLAY_NAME,
@@ -514,8 +510,6 @@ function registerOmnirouteProvider(pi: ExtensionAPI, baseUrl: string, models: Pr
     api: "openai-completions",
     models,
   });
-
-  return true;
 }
 
 async function responseErrorSummary(response: Response) {
@@ -602,13 +596,6 @@ async function refreshCacheFromDiscovery(baseUrl: string) {
   return models;
 }
 
-async function refreshModelsAndUpdateProvider(pi: ExtensionAPI, baseUrl: string) {
-  const models = await refreshCacheFromDiscovery(baseUrl);
-  if (models.length === 0) return;
-
-  registerOmnirouteProvider(pi, baseUrl, models);
-}
-
 function warnProviderUpdateFailure(error: unknown) {
   console.warn(`[${PROVIDER}] Model discovery succeeded but provider update failed: ${errorMessage(error)}`);
 }
@@ -644,7 +631,12 @@ export default async function (pi: ExtensionAPI) {
     if (refreshInFlight) return refreshInFlight;
     if (!getDiscoveryApiKey()) return undefined;
 
-    refreshInFlight = refreshModelsAndUpdateProvider(pi, baseUrl)
+    refreshInFlight = (async () => {
+      const models = await refreshCacheFromDiscovery(baseUrl);
+      if (models.length === 0) return;
+
+      registerOmnirouteProvider(pi, baseUrl, models);
+    })()
       .catch(warnProviderUpdateFailure)
       .finally(() => {
         refreshInFlight = undefined;
@@ -658,7 +650,7 @@ export default async function (pi: ExtensionAPI) {
     void scheduleRefresh();
   });
 
-  if (shouldBootstrapModels(args)) {
+  if (!hasHelpArg(args)) {
     await bootstrapModels(
       pi,
       baseUrl,
