@@ -40,8 +40,12 @@ interface FixtureServer {
   baseUrl: string;
   readonly requests: number;
   readonly responses: number;
+  readonly supplementalRequests: number;
+  readonly supplementalResponses: number;
   waitForRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
   waitForResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
+  waitForSupplementalRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
+  waitForSupplementalResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -132,12 +136,27 @@ function createWaiterQueue() {
   };
 }
 
-async function createFixtureServer(options: { delayMs?: number; status?: number; body?: string } = {}): Promise<FixtureServer> {
+async function createFixtureServer(
+  options: { delayMs?: number; status?: number; body?: string; supplementalBody?: string; supplementalStatus?: number } = {},
+): Promise<FixtureServer> {
   const fixture = await readFile(fixturePath, "utf8");
   const requestCounter = createWaiterQueue();
   const responseCounter = createWaiterQueue();
+  const supplementalRequestCounter = createWaiterQueue();
+  const supplementalResponseCounter = createWaiterQueue();
 
   const server = http.createServer(async (req, res) => {
+    if (req.url === "/api/v1/vscode/_/models") {
+      supplementalRequestCounter.increment();
+      res.on("finish", () => {
+        supplementalResponseCounter.increment();
+      });
+
+      res.writeHead(options.supplementalStatus ?? (options.supplementalBody === undefined ? 404 : 200), { "content-type": "application/json" });
+      res.end(options.supplementalBody ?? "");
+      return;
+    }
+
     if (req.url !== "/v1/models") {
       res.writeHead(404).end();
       return;
@@ -172,8 +191,16 @@ async function createFixtureServer(options: { delayMs?: number; status?: number;
     get responses() {
       return responseCounter.value;
     },
+    get supplementalRequests() {
+      return supplementalRequestCounter.value;
+    },
+    get supplementalResponses() {
+      return supplementalResponseCounter.value;
+    },
     waitForRequests: (target: number, message: string, timeoutMs?: number) => requestCounter.waitFor(target, message, timeoutMs),
     waitForResponses: (target: number, message: string, timeoutMs?: number) => responseCounter.waitFor(target, message, timeoutMs),
+    waitForSupplementalRequests: (target: number, message: string, timeoutMs?: number) => supplementalRequestCounter.waitFor(target, message, timeoutMs),
+    waitForSupplementalResponses: (target: number, message: string, timeoutMs?: number) => supplementalResponseCounter.waitFor(target, message, timeoutMs),
     close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
   };
 }
@@ -473,7 +500,7 @@ describe("OmniRoute model catalog cache", () => {
         }
       });
 
-      assert.ok(warns.some((line) => line.includes("Ignoring invalid model cache") || line.includes("Could not read model cache") || line.includes("VSCode model effort discovery failed")), "invalid cache cases should emit expected warnings");
+      assert.ok(warns.some((line) => line.includes("Ignoring invalid model cache") || line.includes("Could not read model cache") || line.includes("Supplemental reasoning-effort discovery failed")), "invalid cache cases should emit expected warnings");
     } finally {
       await server.close();
     }
@@ -823,7 +850,12 @@ describe("OmniRoute model catalog cache", () => {
       await server.waitForResponses(1, "real fixture normalization should complete once the live catalog is fetched");
       await waitForProviderCount(harness, 2, "live refresh should register a normalized provider list");
 
-      const models = latestProvider(harness)!.config.models ?? [];
+      const liveRegistration = latestProvider(harness)!;
+      assert.equal(liveRegistration.name, "omniroute", "live provider should be registered under the OmniRoute provider key");
+      assert.equal(liveRegistration.config.name, "OmniRoute", "live provider should expose the OmniRoute display name");
+      assert.equal(liveRegistration.config.api, "openai-completions", "live provider should use Pi's OpenAI-compatible completions API");
+
+      const models = liveRegistration.config.models ?? [];
       const modelById = new Map(models.map((model) => [model.id, model]));
 
       const textOnly = modelById.get("oc/big-pickle");
@@ -850,6 +882,47 @@ describe("OmniRoute model catalog cache", () => {
       assert.equal(modelById.has("cx/gpt-5.5-high"), false, "thinking variants should merge into the base model instead of appearing separately");
       assert.equal(modelById.has("cx/gpt-5.5-xhigh"), false, "thinking variants should merge into the base model instead of appearing separately");
       assert.equal(modelById.has("codex/gpt-5.5"), true, "the normalized catalog should keep a single GPT 5.5 entry from the usable text-output variant and drop the image-output duplicate");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("merges supplemental reasoning effort metadata into thinking levels", async () => {
+    const supplementalBody = JSON.stringify({
+      data: [
+        {
+          id: "ddgw/gpt-4o-mini",
+          supportedReasoningEfforts: ["off", "low", "high", "max"],
+        },
+      ],
+    });
+
+    const server = await createFixtureServer({ supplementalBody });
+    try {
+      const cachePath = join(tempDir, "supplemental-efforts.json");
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness();
+      await extension(harness.api);
+
+      assert.equal(server.requests, 1, "live discovery should fetch the primary model catalog once");
+      assert.equal(server.supplementalRequests, 1, "live discovery should fetch supplemental reasoning-effort metadata once");
+      assert.equal(server.supplementalResponses, 1, "supplemental reasoning-effort metadata request should complete once");
+
+      const model = latestProvider(harness)!.config.models?.find((candidate) => candidate.id === "ddgw/gpt-4o-mini");
+      assert.ok(model, "fixture should normalize the DuckDuckGo GPT 4o Mini model");
+      assert.equal(model.reasoning, true, "supplemental reasoning efforts should mark a non-reasoning catalog entry as reasoning-capable");
+      assert.deepEqual(
+        model.thinkingLevelMap,
+        {
+          minimal: null,
+          low: "low",
+          medium: null,
+          high: "high",
+          xhigh: "xhigh",
+        },
+        "supplemental reasoning efforts should merge into the provider thinking level map and ignore off/none",
+      );
     } finally {
       await server.close();
     }

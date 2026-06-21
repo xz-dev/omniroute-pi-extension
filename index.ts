@@ -44,7 +44,7 @@ interface ReasoningConfigSchema {
   };
 }
 
-interface VscodeModel {
+interface ReasoningMetadataModel {
   id?: string;
   root?: string;
   owned_by?: string;
@@ -159,7 +159,7 @@ function parseReasoningEfforts(values: unknown): ReasoningEffort[] {
   return efforts;
 }
 
-function getEffortsFromVscodeModel(model: VscodeModel): ReasoningEffort[] {
+function getEffortsFromReasoningMetadata(model: ReasoningMetadataModel): ReasoningEffort[] {
   for (const candidate of [
     model.supportsReasoningEffort,
     model.supports_reasoning_effort,
@@ -200,12 +200,12 @@ function mergeEffortIntoIndex(index: Map<string, ReasoningEffort[]>, key: string
   index.set(key, mergeThinkingLevels(index.get(key) ?? [], efforts));
 }
 
-function buildVscodeEffortIndex(vscodeModels: VscodeModel[]) {
+function buildSupplementalEffortIndex(metadataModels: ReasoningMetadataModel[]) {
   const strict = new Map<string, ReasoningEffort[]>();
   const rootCandidates = new Map<string, { count: number; efforts: ReasoningEffort[] }>();
 
-  for (const model of vscodeModels) {
-    const efforts = getEffortsFromVscodeModel(model);
+  for (const model of metadataModels) {
+    const efforts = getEffortsFromReasoningMetadata(model);
     if (efforts.length === 0) continue;
 
     for (const key of strictModelKeys(model)) {
@@ -230,9 +230,9 @@ function buildVscodeEffortIndex(vscodeModels: VscodeModel[]) {
   return { strict, root };
 }
 
-type VscodeEffortIndex = ReturnType<typeof buildVscodeEffortIndex>;
+type SupplementalEffortIndex = ReturnType<typeof buildSupplementalEffortIndex>;
 
-function getVscodeEffortsForModel(model: OmnirouteModel, effortIndex: VscodeEffortIndex) {
+function getSupplementalEffortsForModel(model: OmnirouteModel, effortIndex: SupplementalEffortIndex) {
   let efforts: ReasoningEffort[] = [];
   for (const key of strictModelKeys(model)) {
     efforts = mergeThinkingLevels(efforts, effortIndex.strict.get(key) ?? []);
@@ -260,7 +260,7 @@ function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]): Provid
   };
 }
 
-function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortIndex): ProviderModel[] {
+function normalizeModels(rawModels: OmnirouteModel[], effortIndex: SupplementalEffortIndex): ProviderModel[] {
   const deduped = new Map<string, OmnirouteModel>();
   for (const model of rawModels.filter((candidate) => candidate?.id && isTextModel(candidate))) {
     const current = deduped.get(model.id);
@@ -287,7 +287,7 @@ function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortI
         }
       }
 
-      const levels = mergeThinkingLevels(matchedLevels, getVscodeEffortsForModel(model, effortIndex));
+      const levels = mergeThinkingLevels(matchedLevels, getSupplementalEffortsForModel(model, effortIndex));
 
       used.add(id);
       normalized.push(toProviderModel(model, levels));
@@ -295,7 +295,7 @@ function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortI
     }
 
     if (!used.has(base)) {
-      const levels = mergeThinkingLevels([level], getVscodeEffortsForModel(model, effortIndex));
+      const levels = mergeThinkingLevels([level], getSupplementalEffortsForModel(model, effortIndex));
       used.add(id);
       normalized.push(toProviderModel(model, levels));
     }
@@ -304,7 +304,7 @@ function normalizeModels(rawModels: OmnirouteModel[], effortIndex: VscodeEffortI
   return normalized;
 }
 
-function deriveVscodeModelsUrl(baseUrl: string) {
+function deriveSupplementalReasoningMetadataUrl(baseUrl: string) {
   const trimmed = baseUrl.trim().replace(/\/+$/, "");
 
   try {
@@ -544,31 +544,31 @@ async function discoverModels() {
 
     const payload = (await mainResponse.json()) as DataPayload<OmnirouteModel>;
 
-    const vscodeModelsUrl = deriveVscodeModelsUrl(baseUrl);
-    let vscodeEffortsIndex = buildVscodeEffortIndex([]);
+    const supplementalMetadataUrl = deriveSupplementalReasoningMetadataUrl(baseUrl);
+    let supplementalEffortIndex = buildSupplementalEffortIndex([]);
 
     try {
-      const vscodeResponse = await fetch(vscodeModelsUrl, {
+      const supplementalResponse = await fetch(supplementalMetadataUrl, {
         headers,
         signal: timeoutSignal.signal,
       });
 
-      if (vscodeResponse.ok) {
-        const vscodePayload = (await vscodeResponse.json()) as DataPayload<VscodeModel>;
-        vscodeEffortsIndex = buildVscodeEffortIndex(vscodePayload.data ?? []);
-      } else if (vscodeResponse.status !== 404) {
+      if (supplementalResponse.ok) {
+        const supplementalPayload = (await supplementalResponse.json()) as DataPayload<ReasoningMetadataModel>;
+        supplementalEffortIndex = buildSupplementalEffortIndex(supplementalPayload.data ?? []);
+      } else if (supplementalResponse.status !== 404) {
         console.warn(
-          `[${PROVIDER}] VSCode model effort discovery failed (${vscodeResponse.status}); continuing with suffix inference only.`,
+          `[${PROVIDER}] Supplemental reasoning-effort discovery failed (${supplementalResponse.status}); continuing with suffix inference only.`,
         );
       }
-    } catch (vscodeError) {
+    } catch (supplementalError) {
       console.warn(
-        `[${PROVIDER}] VSCode model effort discovery failed; continuing with suffix inference only.`,
-        vscodeError instanceof Error ? vscodeError.message : vscodeError,
+        `[${PROVIDER}] Supplemental reasoning-effort discovery failed; continuing with suffix inference only.`,
+        supplementalError instanceof Error ? supplementalError.message : supplementalError,
       );
     }
 
-    const models = normalizeModels(payload.data ?? [], vscodeEffortsIndex);
+    const models = normalizeModels(payload.data ?? [], supplementalEffortIndex);
     if (models.length > 0) return models;
 
     throw new Error("Model discovery returned no usable text models");

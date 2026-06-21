@@ -2,6 +2,12 @@
 
 A Pi extension that registers the `omniroute` model provider from an OmniRoute-compatible gateway.
 
+## Installation
+
+```bash
+pi install git:github.com/xz-dev/omniroute-pi-extension
+```
+
 ## What it does
 
 - Reads `OMNIROUTE_BASE_URL` and `OMNIROUTE_API_KEY`.
@@ -23,7 +29,7 @@ A Pi extension that registers the `omniroute` model provider from an OmniRoute-c
 Default cache path:
 
 ```text
-${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<sha256(baseUrl)[0..16]>.json
+${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<first 16 hex chars of sha256(baseUrl)>.json
 ```
 
 ## Commands
@@ -37,4 +43,5 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<sha256(baseUrl)[0..16]>.js
 - `index.ts` — extension entry point.
 - `tests/omniroute-cache.test.ts` — model catalog cache tests.
 - `docs/features.md` — runtime behavior notes.
-- `docs/adr/0001-cache-model-catalog-for-interactive-startup.md` — design record for cache-first startup.
+- `docs/adr/0001-discover-reasoning-effort-metadata.md` — design record for reasoning-effort discovery beyond `/v1/models`.
+- `docs/adr/0002-cache-model-catalog-for-interactive-startup.md` — design record for cache-first startup.

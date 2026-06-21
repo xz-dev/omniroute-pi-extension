@@ -29,7 +29,7 @@ This document records the runtime features and invariants implemented by the Omn
 The default cache path is:
 
 ```text
-${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<sha256(baseUrl)[0..16]>.json
+${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<first 16 hex chars of sha256(baseUrl)>.json
 ```
 
 ## Model Catalog Cache
@@ -78,19 +78,19 @@ All non-metadata startup paths follow the same provider availability invariant: 
 
 ## Live discovery
 
-Live discovery uses two OmniRoute endpoints:
+Live discovery uses the OpenAI-compatible `${OMNIROUTE_BASE_URL}/models` endpoint as the primary model catalog. That `/v1/models` shape does not standardize Pi thinking-level / reasoning-effort metadata, so the extension first infers thinking levels from model ID suffixes and then probes a supplemental OmniRoute metadata endpoint.
 
-1. `${OMNIROUTE_BASE_URL}/models` for the primary model catalog.
-2. A derived VS Code model endpoint for reasoning-effort metadata:
+The currently available supplemental endpoint is the VS Code-compatible route:
 
 ```text
 <base path without trailing /api or /v1>/api/v1/vscode/_/models
 ```
 
-The VS Code endpoint is optional:
+The extension uses this endpoint only because it can expose reasoning-effort metadata; it does not depend on VS Code itself. The supplemental endpoint is optional:
 
 - `404` is ignored.
 - Other failures are warned about, but primary discovery continues with suffix-based thinking-level inference.
+- Reasoning-effort metadata is read from `supportsReasoningEffort`, `supports_reasoning_effort`, `supportedReasoningEfforts`, `configSchema.properties.reasoningEffort.enum`, or `configurationSchema.properties.reasoningEffort.enum`; matching uses strict model keys (`id`, `parent`, `owned_by/root`) first, then a root fallback only when that root appears once in the supplemental metadata.
 
 ## Model normalization
 
@@ -108,8 +108,8 @@ Normalization rules:
   - `-medium`
   - `-high`
   - `-xhigh`
-- Merges suffix-inferred thinking levels with VS Code reasoning-effort metadata.
-- Marks a model as reasoning-capable when raw capabilities include `reasoning`/`thinking` or when thinking levels are discovered.
+- Infers thinking levels from suffix variants first, then merges supplemental reasoning-effort metadata when available.
+- Marks a model as reasoning-capable when raw capabilities include `reasoning`/`thinking` or when thinking levels are discovered; `off`/`none` are ignored and `max` maps to Pi `xhigh`.
 - Maps unsupported thinking levels to `null` in `thinkingLevelMap` so Pi can hide or clamp them.
 - For `deepseek-thinking` family models, maps Pi `xhigh` to provider value `max`.
 - Sets input modalities to `['text']` or `['text', 'image']`.
@@ -143,6 +143,8 @@ The test suite covers:
 - TUI-only `session_start` refresh;
 - preserving cached provider when live discovery returns invalid payloads;
 - real fixture model normalization;
+- successful supplemental reasoning-effort metadata merging;
+- provider config shape assertions (`name`, `api`, and literal `apiKey` reference);
 - secret non-leakage into cache/fixtures;
 - base URL normalization;
 - default cache path derivation under `PI_CODING_AGENT_DIR`.
