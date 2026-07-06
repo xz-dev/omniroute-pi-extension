@@ -42,6 +42,7 @@ interface FixtureServer {
   readonly responses: number;
   readonly supplementalRequests: number;
   readonly supplementalResponses: number;
+  readonly lastModelRequestUrl: string | undefined;
   waitForRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
   waitForResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
   waitForSupplementalRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
@@ -136,17 +137,56 @@ function createWaiterQueue() {
   };
 }
 
+interface FixtureModel {
+  id?: string;
+  parent?: string | null;
+  root?: string | null;
+  owned_by?: string;
+  [key: string]: unknown;
+}
+
+function buildAliasOnlyFixture(fixture: string) {
+  const payload = JSON.parse(fixture) as { data?: FixtureModel[] };
+  if (!Array.isArray(payload.data)) return fixture;
+
+  const aliasRoots = new Map<string, FixtureModel>();
+  for (const model of payload.data) {
+    if (typeof model.id === "string" && model.parent == null && typeof model.root === "string" && typeof model.owned_by === "string") {
+      aliasRoots.set(model.id, model);
+    }
+  }
+
+  const bareModelParents = new Set<string>();
+  for (const model of payload.data) {
+    if (typeof model.id !== "string" || model.id.includes("/")) continue;
+    if (typeof model.parent === "string") bareModelParents.add(model.parent);
+  }
+
+  const aliasOnlyData = payload.data.filter((model) => {
+    if (typeof model.id !== "string" || typeof model.parent !== "string" || !model.id.includes("/")) return true;
+    const aliasRoot = aliasRoots.get(model.parent);
+    if (!aliasRoot) return true;
+    if (aliasRoot.root !== model.root || aliasRoot.owned_by !== model.owned_by) return true;
+    return bareModelParents.has(model.id);
+  });
+
+  return `${JSON.stringify({ ...payload, data: aliasOnlyData })}\n`;
+}
+
 async function createFixtureServer(
   options: { delayMs?: number; status?: number; body?: string; supplementalBody?: string; supplementalStatus?: number } = {},
 ): Promise<FixtureServer> {
   const fixture = await readFile(fixturePath, "utf8");
+  const aliasFixture = buildAliasOnlyFixture(fixture);
   const requestCounter = createWaiterQueue();
   const responseCounter = createWaiterQueue();
   const supplementalRequestCounter = createWaiterQueue();
   const supplementalResponseCounter = createWaiterQueue();
+  let lastModelRequestUrl: string | undefined;
 
   const server = http.createServer(async (req, res) => {
-    if (req.url === "/api/v1/vscode/_/models") {
+    const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+    if (requestUrl.pathname === "/api/v1/vscode/_/models") {
       supplementalRequestCounter.increment();
       res.on("finish", () => {
         supplementalResponseCounter.increment();
@@ -157,11 +197,12 @@ async function createFixtureServer(
       return;
     }
 
-    if (req.url !== "/v1/models") {
+    if (requestUrl.pathname !== "/v1/models") {
       res.writeHead(404).end();
       return;
     }
 
+    lastModelRequestUrl = req.url;
     requestCounter.increment();
     res.on("finish", () => {
       responseCounter.increment();
@@ -171,8 +212,10 @@ async function createFixtureServer(
       await new Promise((resolve) => setTimeout(resolve, options.delayMs));
     }
 
+    const responseBody =
+      options.body ?? (requestUrl.searchParams.get("prefix") === "alias" ? aliasFixture : fixture);
     res.writeHead(options.status ?? 200, { "content-type": "application/json" });
-    res.end(options.body ?? fixture);
+    res.end(responseBody);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -196,6 +239,9 @@ async function createFixtureServer(
     },
     get supplementalResponses() {
       return supplementalResponseCounter.value;
+    },
+    get lastModelRequestUrl() {
+      return lastModelRequestUrl;
     },
     waitForRequests: (target: number, message: string, timeoutMs?: number) => requestCounter.waitFor(target, message, timeoutMs),
     waitForResponses: (target: number, message: string, timeoutMs?: number) => responseCounter.waitFor(target, message, timeoutMs),
@@ -859,6 +905,10 @@ describe("OmniRoute model catalog cache", () => {
       assert.equal(liveRegistration.name, "omniroute", "live provider should be registered under the OmniRoute provider key");
       assert.equal(liveRegistration.config.name, "OmniRoute", "live provider should expose the OmniRoute display name");
       assert.equal(liveRegistration.config.api, "openai-completions", "live provider should use Pi's OpenAI-compatible completions API");
+      assert.ok(
+        server.lastModelRequestUrl?.includes("prefix=alias"),
+        "live discovery should request the alias prefix mode so the catalog shows short provider aliases instead of full provider ids",
+      );
 
       const models = liveRegistration.config.models ?? [];
       const modelById = new Map(models.map((model) => [model.id, model]));
@@ -886,7 +936,7 @@ describe("OmniRoute model catalog cache", () => {
       assert.equal(modelById.has("cx/gpt-5.5-medium"), false, "thinking variants should merge into the base model instead of appearing separately");
       assert.equal(modelById.has("cx/gpt-5.5-high"), false, "thinking variants should merge into the base model instead of appearing separately");
       assert.equal(modelById.has("cx/gpt-5.5-xhigh"), false, "thinking variants should merge into the base model instead of appearing separately");
-      assert.equal(modelById.has("codex/gpt-5.5"), true, "the normalized catalog should keep a single GPT 5.5 entry from the usable text-output variant and drop the image-output duplicate");
+      assert.equal(modelById.has("codex/gpt-5.5"), false, "the normalized catalog should drop the canonical provider-id form when the alias root cx/gpt-5.5 is present, so the UI shows the short alias prefix only");
     } finally {
       await server.close();
     }

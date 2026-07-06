@@ -532,7 +532,7 @@ async function discoverModels(baseUrl: string) {
   const timeout = setTimeout(() => timeoutSignal.abort(), getDiscoveryTimeoutMs());
 
   try {
-    const mainResponse = await fetch(`${baseUrl}/models`, {
+    const mainResponse = await fetch(`${baseUrl}/models?prefix=alias`, {
       headers,
       signal: timeoutSignal.signal,
     });
