@@ -79,7 +79,7 @@ All non-metadata startup paths follow the same provider availability invariant: 
 
 ## Live discovery
 
-Live discovery uses the OpenAI-compatible `${OMNIROUTE_BASE_URL}/models` endpoint as the primary model catalog. That `/v1/models` shape does not standardize Pi thinking-level / reasoning-effort metadata, so the extension first infers thinking levels from model ID suffixes and then probes a supplemental OmniRoute metadata endpoint.
+Live discovery uses the OpenAI-compatible `${OMNIROUTE_BASE_URL}/models?prefix=alias` endpoint as the primary model catalog, asking OmniRoute to emit the short provider alias prefix (e.g. `cx/...`, `ollamacloud/...`) instead of the full canonical provider id. That `/v1/models` shape does not standardize Pi thinking-level / reasoning-effort metadata, so the extension first infers thinking levels from model ID suffixes and then probes a supplemental OmniRoute metadata endpoint.
 
 The currently available supplemental endpoint is the VS Code-compatible route:
 
@@ -99,6 +99,7 @@ The extension converts raw OmniRoute models into Pi provider models.
 
 Normalization rules:
 
+- Uses the short provider alias prefix (e.g. `cx/gpt-5.5`, `ollamacloud/deepseek-v4-pro`) instead of the full canonical provider-id prefix (e.g. `codex/gpt-5.5`, `ollama-cloud/deepseek-v4-pro`), because the UI shows the short alias. Live discovery relies on OmniRoute's `?prefix=alias` catalog mode to emit alias-prefixed model ids.
 - Excludes image-output-only models and models whose output modalities do not include text.
 - Deduplicates raw entries by model `id`.
 - For duplicate IDs, prefers the variant with image input support, then the larger context window, then the larger max output token count.
