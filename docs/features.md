@@ -79,7 +79,7 @@ All non-metadata startup paths follow the same provider availability invariant: 
 
 ## Live discovery
 
-Live discovery uses the OpenAI-compatible `${OMNIROUTE_BASE_URL}/models?prefix=alias` endpoint as the primary model catalog, asking OmniRoute to emit the short provider alias prefix (e.g. `cx/...`, `ollamacloud/...`) instead of the full canonical provider id. That `/v1/models` shape does not standardize Pi thinking-level / reasoning-effort metadata, so the extension first infers thinking levels from model ID suffixes and then probes a supplemental OmniRoute metadata endpoint.
+Live discovery uses the OpenAI-compatible `${OMNIROUTE_BASE_URL}/models?prefix=alias` endpoint as the primary model catalog, asking OmniRoute to emit the short provider alias prefix (e.g. `cx/...`, `ollamacloud/...`) instead of the full canonical provider ID. The `/v1/models` shape does not standardize Pi thinking-level / reasoning-effort metadata, so the extension first infers efforts from a strict model ID suffix whitelist and then probes a supplemental OmniRoute metadata endpoint.
 
 The currently available supplemental endpoint is the VS Code-compatible route:
 
@@ -104,14 +104,12 @@ Normalization rules:
 - Deduplicates raw entries by model `id`.
 - For duplicate IDs, prefers the variant with image input support, then the larger context window, then the larger max output token count.
 - Sorts models by ID for deterministic output.
-- Collapses thinking-level suffix variants into a single semantic model entry when IDs end in one of:
-  - `-minimal`
-  - `-low`
-  - `-medium`
-  - `-high`
-  - `-xhigh`
-- Infers thinking levels from suffix variants first, then merges supplemental reasoning-effort metadata when available.
-- Marks a model as reasoning-capable when raw capabilities include `reasoning`/`thinking` or when thinking levels are discovered; `off`/`none` are ignored and `max` maps to Pi `xhigh`.
+- Recognizes only the suffixes `-none`, `-low`, `-medium`, `-high`, `-xhigh`, and `-max` as reasoning variants.
+- Folds a suffix variant only when its exact suffix-stripped base is present as an eligible text model in the same primary catalog response.
+- Keeps unknown suffixes and whitelisted suffix IDs without an eligible text base independently routable; an image-output model with the same bare ID is not treated as the base, and no bare model ID is synthesized.
+- Infers reasoning efforts from verified suffix variants first, then merges supplemental reasoning-effort metadata when available.
+- Maps `none` to Pi's `off` and preserves `max` as a distinct level above `xhigh`; Pi `minimal` remains unsupported because no compatible OmniRoute effort is mapped.
+- Marks a model as reasoning-capable when raw capabilities include `reasoning`/`thinking` or when reasoning efforts are discovered.
 - Maps unsupported thinking levels to `null` in `thinkingLevelMap` so Pi can hide or clamp them.
 - For `deepseek-thinking` family models, maps Pi `xhigh` to provider value `max`.
 - Sets input modalities to `['text']` or `['text', 'image']`.
