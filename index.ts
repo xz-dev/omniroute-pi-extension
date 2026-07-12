@@ -60,8 +60,8 @@ interface DataPayload<T> {
   data?: T[];
 }
 
-type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
-type ReasoningEffort = ThinkingLevel;
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 type ProviderInput = "text" | "image";
 
 interface ProviderModel {
@@ -84,8 +84,10 @@ interface ModelCache {
   models: ProviderModel[];
 }
 
-const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh"] as const;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
+const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
+const REASONING_EFFORT_SET = new Set<string>(REASONING_EFFORTS);
 const DEEPSEEK_THINKING_FAMILY = "deepseek-thinking";
 const DEEPSEEK_COMPAT = {
   thinkingFormat: "deepseek",
@@ -116,25 +118,31 @@ function betterModel(a: OmnirouteModel, b: OmnirouteModel): OmnirouteModel {
   return a;
 }
 
-function normalizeThinkingLevels(levels: ThinkingLevel[], options?: { xhighValue?: string }) {
-  const has = new Set(levels);
-  return Object.fromEntries(
-    THINKING_LEVELS.map((level) => [level, has.has(level) ? (level === "xhigh" ? (options?.xhighValue ?? level) : level) : null]),
-  ) as Record<ThinkingLevel, string | null>;
+function normalizeThinkingLevels(efforts: ReasoningEffort[], options?: { xhighValue?: string }) {
+  const has = new Set(efforts);
+  return {
+    off: has.has("none") ? "none" : null,
+    minimal: null,
+    low: has.has("low") ? "low" : null,
+    medium: has.has("medium") ? "medium" : null,
+    high: has.has("high") ? "high" : null,
+    xhigh: has.has("xhigh") ? (options?.xhighValue ?? "xhigh") : null,
+    max: has.has("max") ? "max" : null,
+  } satisfies Record<ThinkingLevel, string | null>;
 }
 
-function mergeThinkingLevels(baseLevels: ThinkingLevel[], extraLevels: ReasoningEffort[]) {
-  return [...new Set([...baseLevels, ...extraLevels])];
+function mergeReasoningEfforts(baseEfforts: ReasoningEffort[], extraEfforts: ReasoningEffort[]) {
+  return [...new Set([...baseEfforts, ...extraEfforts])];
 }
 
-function isThinkingVariant(id: string): { base: string; level?: ThinkingLevel } {
+function parseReasoningVariant(id: string): { base: string; effort?: ReasoningEffort } {
   const dash = id.lastIndexOf("-");
   if (dash < 0) return { base: id };
 
-  const suffix = id.slice(dash + 1);
-  if (!THINKING_LEVEL_SET.has(suffix)) return { base: id };
+  const suffix = id.slice(dash + 1).toLowerCase();
+  if (!REASONING_EFFORT_SET.has(suffix)) return { base: id };
 
-  return { base: id.slice(0, dash), level: suffix as ThinkingLevel };
+  return { base: id.slice(0, dash), effort: suffix as ReasoningEffort };
 }
 
 function parseReasoningEfforts(values: unknown): ReasoningEffort[] {
@@ -146,10 +154,8 @@ function parseReasoningEfforts(values: unknown): ReasoningEffort[] {
     if (typeof value !== "string") continue;
 
     const normalized = value.trim().toLowerCase().replace(/[_\s-]+/g, "");
-    if (normalized === "off" || normalized === "none") continue;
-
-    const effort = normalized === "max" ? "xhigh" : (normalized as ReasoningEffort);
-    if (!THINKING_LEVEL_SET.has(effort)) continue;
+    const effort = normalized === "off" ? "none" : (normalized as ReasoningEffort);
+    if (!REASONING_EFFORT_SET.has(effort)) continue;
 
     if (!efforts.includes(effort)) {
       efforts.push(effort);
@@ -191,13 +197,14 @@ function strictModelKeys(model: { id?: string; root?: string; parent?: string | 
   return [...keys];
 }
 
-function rootModelKey(model: { root?: string }) {
-  return normalizeModelToken(model.root);
+function rootModelKey(model: { id?: string; root?: string }) {
+  const root = model.root ?? model.id?.split("/").pop();
+  return normalizeModelToken(root);
 }
 
 function mergeEffortIntoIndex(index: Map<string, ReasoningEffort[]>, key: string | undefined, efforts: ReasoningEffort[]) {
   if (!key) return;
-  index.set(key, mergeThinkingLevels(index.get(key) ?? [], efforts));
+  index.set(key, mergeReasoningEfforts(index.get(key) ?? [], efforts));
 }
 
 function buildSupplementalEffortIndex(metadataModels: ReasoningMetadataModel[]) {
@@ -217,7 +224,7 @@ function buildSupplementalEffortIndex(metadataModels: ReasoningMetadataModel[]) 
       const current = rootCandidates.get(rootKey) ?? { count: 0, efforts: [] };
       rootCandidates.set(rootKey, {
         count: current.count + 1,
-        efforts: mergeThinkingLevels(current.efforts, efforts),
+        efforts: mergeReasoningEfforts(current.efforts, efforts),
       });
     }
   }
@@ -235,17 +242,17 @@ type SupplementalEffortIndex = ReturnType<typeof buildSupplementalEffortIndex>;
 function getSupplementalEffortsForModel(model: OmnirouteModel, effortIndex: SupplementalEffortIndex) {
   let efforts: ReasoningEffort[] = [];
   for (const key of strictModelKeys(model)) {
-    efforts = mergeThinkingLevels(efforts, effortIndex.strict.get(key) ?? []);
+    efforts = mergeReasoningEfforts(efforts, effortIndex.strict.get(key) ?? []);
   }
   if (efforts.length > 0) return efforts;
 
   return effortIndex.root.get(rootModelKey(model) ?? "") ?? [];
 }
 
-function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]): ProviderModel {
-  const reasoning = Boolean(model.capabilities?.reasoning || model.capabilities?.thinking || levels.length > 0);
+function toProviderModel(model: OmnirouteModel, efforts: ReasoningEffort[]): ProviderModel {
+  const reasoning = Boolean(model.capabilities?.reasoning || model.capabilities?.thinking || efforts.length > 0);
   const isDeepseekFamily = model.family === DEEPSEEK_THINKING_FAMILY;
-  const thinkingLevelMap = normalizeThinkingLevels(levels, { xhighValue: isDeepseekFamily ? "max" : undefined });
+  const thinkingLevelMap = normalizeThinkingLevels(efforts, { xhighValue: isDeepseekFamily ? "max" : undefined });
 
   return {
     id: model.id,
@@ -260,6 +267,16 @@ function toProviderModel(model: OmnirouteModel, levels: ThinkingLevel[]): Provid
   };
 }
 
+function resolveVerifiedVariantBase(
+  id: string,
+  catalogIds: Set<string>,
+): { baseId: string; effort: ReasoningEffort } | undefined {
+  const parsed = parseReasoningVariant(id);
+  if (!parsed.effort || !catalogIds.has(parsed.base)) return undefined;
+
+  return { baseId: parsed.base, effort: parsed.effort };
+}
+
 function normalizeModels(rawModels: OmnirouteModel[], effortIndex: SupplementalEffortIndex): ProviderModel[] {
   const deduped = new Map<string, OmnirouteModel>();
   for (const model of rawModels.filter((candidate) => candidate?.id && isTextModel(candidate))) {
@@ -268,37 +285,28 @@ function normalizeModels(rawModels: OmnirouteModel[], effortIndex: SupplementalE
   }
 
   const models = [...deduped.entries()].sort(([a], [b]) => a.localeCompare(b));
-  const used = new Set<string>();
+  const catalogIds = new Set(deduped.keys());
+  const foldedVariantIds = new Set<string>();
+  const variantEffortsByBase = new Map<string, ReasoningEffort[]>();
+
+  for (const [id] of models) {
+    const variant = resolveVerifiedVariantBase(id, catalogIds);
+    if (!variant) continue;
+
+    foldedVariantIds.add(id);
+    const current = variantEffortsByBase.get(variant.baseId) ?? [];
+    variantEffortsByBase.set(variant.baseId, mergeReasoningEfforts(current, [variant.effort]));
+  }
+
   const normalized: ProviderModel[] = [];
-
   for (const [id, model] of models) {
-    if (used.has(id)) continue;
+    if (foldedVariantIds.has(id)) continue;
 
-    const { base, level } = isThinkingVariant(id);
-    const matchedLevels: ThinkingLevel[] = [];
-
-    if (!level) {
-      for (const [variantId] of models) {
-        if (used.has(variantId)) continue;
-        const parsed = isThinkingVariant(variantId);
-        if (parsed.base === id && parsed.level) {
-          used.add(variantId);
-          matchedLevels.push(parsed.level);
-        }
-      }
-
-      const levels = mergeThinkingLevels(matchedLevels, getSupplementalEffortsForModel(model, effortIndex));
-
-      used.add(id);
-      normalized.push(toProviderModel(model, levels));
-      continue;
-    }
-
-    if (!used.has(base)) {
-      const levels = mergeThinkingLevels([level], getSupplementalEffortsForModel(model, effortIndex));
-      used.add(id);
-      normalized.push(toProviderModel(model, levels));
-    }
+    const efforts = mergeReasoningEfforts(
+      variantEffortsByBase.get(id) ?? [],
+      getSupplementalEffortsForModel(model, effortIndex),
+    );
+    normalized.push(toProviderModel(model, efforts));
   }
 
   return normalized;

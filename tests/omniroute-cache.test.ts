@@ -924,11 +924,13 @@ describe("OmniRoute model catalog cache", () => {
       assert.deepEqual(
         imageCapable!.thinkingLevelMap,
         {
+          off: null,
           minimal: null,
           low: "low",
           medium: "medium",
           high: "high",
           xhigh: "xhigh",
+          max: null,
         },
         "GPT 5.5 thinking variants should merge into a single semantic provider entry",
       );
@@ -942,17 +944,77 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
-  it("merges supplemental reasoning effort metadata into thinking levels", async () => {
+  it("folds only verified reasoning suffix variants and keeps max distinct from xhigh", async () => {
+    const primaryBody = JSON.stringify({
+      data: [
+        {
+          id: "ddgw/gpt-4o-mini",
+          object: "model",
+          root: "gpt-4o-mini",
+          owned_by: "duckduckgo-web",
+          output_modalities: ["text"],
+          context_length: 128000,
+          max_output_tokens: 4096,
+        },
+        {
+          id: "codex/gpt-5.6-sol",
+          name: "GPT 5.6 Sol",
+          object: "model",
+          root: "gpt-5.6-sol",
+          owned_by: "codex",
+          capabilities: { reasoning: true },
+          output_modalities: ["text"],
+          context_length: 400000,
+          max_output_tokens: 128000,
+        },
+        ...["none", "low", "xhigh", "max"].map((effort) => ({
+          id: `codex/gpt-5.6-sol-${effort}`,
+          object: "model",
+          root: `gpt-5.6-sol-${effort}`,
+          owned_by: "codex",
+          output_modalities: ["text"],
+          context_length: 400000,
+          max_output_tokens: 128000,
+        })),
+        {
+          id: "aug/gpt-5.5",
+          object: "model",
+          owned_by: "augment-code",
+          type: "image",
+          output_modalities: ["image"],
+        },
+        {
+          id: "aug/gpt-5.5-high",
+          object: "model",
+          root: "gpt-5.5-high",
+          owned_by: "augment-code",
+          capabilities: { effort_tiers: ["low", "medium", "high"] },
+          output_modalities: ["text"],
+        },
+        {
+          id: "cx/gpt-5.6-sol-ultra",
+          object: "model",
+          root: "gpt-5.6-sol-ultra",
+          owned_by: "codex",
+          output_modalities: ["text"],
+        },
+      ],
+    });
     const supplementalBody = JSON.stringify({
       data: [
         {
           id: "ddgw/gpt-4o-mini",
-          supportedReasoningEfforts: ["off", "low", "high", "max"],
+          supportedReasoningEfforts: ["none", "low", "high", "max"],
+        },
+        {
+          id: "vscode-family-gpt-5.6-sol",
+          root: "gpt-5.6-sol",
+          supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
         },
       ],
     });
 
-    const server = await createFixtureServer({ supplementalBody });
+    const server = await createFixtureServer({ body: primaryBody, supplementalBody });
     try {
       const cachePath = join(tempDir, "supplemental-efforts.json");
       configureCacheStartup(server.baseUrl, cachePath, []);
@@ -964,20 +1026,47 @@ describe("OmniRoute model catalog cache", () => {
       assert.equal(server.supplementalRequests, 1, "live discovery should fetch supplemental reasoning-effort metadata once");
       assert.equal(server.supplementalResponses, 1, "supplemental reasoning-effort metadata request should complete once");
 
-      const model = latestProvider(harness)!.config.models?.find((candidate) => candidate.id === "ddgw/gpt-4o-mini");
-      assert.ok(model, "fixture should normalize the DuckDuckGo GPT 4o Mini model");
-      assert.equal(model.reasoning, true, "supplemental reasoning efforts should mark a non-reasoning catalog entry as reasoning-capable");
+      const models = latestProvider(harness)!.config.models ?? [];
+      const model = models.find((candidate) => candidate.id === "ddgw/gpt-4o-mini");
+      assert.ok(model, "primary model should remain registered");
       assert.deepEqual(
         model.thinkingLevelMap,
         {
+          off: "none",
           minimal: null,
           low: "low",
           medium: null,
           high: "high",
-          xhigh: "xhigh",
+          xhigh: null,
+          max: "max",
         },
-        "supplemental reasoning efforts should merge into the provider thinking level map and ignore off/none",
+        "supplemental none and max efforts should map to Pi off and max without conflation",
       );
+      assert.deepEqual(model.input, ["text"], "primary catalog metadata should remain the source of model capabilities");
+      assert.equal(model.contextWindow, 128000, "primary catalog metadata should remain the source of context limits");
+
+      const gpt56 = models.find((candidate) => candidate.id === "codex/gpt-5.6-sol");
+      assert.ok(gpt56, "the exact primary base model should remain registered");
+      assert.equal(gpt56.name, "gpt-5.6-sol", "the primary base entry should remain the source of display metadata");
+      assert.deepEqual(
+        gpt56.thinkingLevelMap,
+        {
+          off: "none",
+          minimal: null,
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: "max",
+        },
+        "verified suffix variants and supplemental metadata should merge into the exact canonical base",
+      );
+      assert.equal(models.some((candidate) => candidate.id === "vscode-family-gpt-5.6-sol"), false, "supplemental VS Code metadata must not create or replace registered model ids");
+      for (const effort of ["none", "low", "xhigh", "max"]) {
+        assert.equal(models.some((candidate) => candidate.id === `codex/gpt-5.6-sol-${effort}`), false, `verified ${effort} variants should fold into the canonical base`);
+      }
+      assert.equal(models.some((candidate) => candidate.id === "aug/gpt-5.5-high"), true, "a whitelisted suffix without an eligible text base must remain routable even when a same-ID base is image-only and the variant advertises effort tiers");
+      assert.equal(models.some((candidate) => candidate.id === "cx/gpt-5.6-sol-ultra"), true, "unknown future suffixes must remain untouched");
     } finally {
       await server.close();
     }
