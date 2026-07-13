@@ -88,6 +88,8 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);
 const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 const REASONING_EFFORT_SET = new Set<string>(REASONING_EFFORTS);
+const SYNTHETIC_CODEX_ULTRA_ROOTS = new Set(["gpt-5.6-sol-ultra", "gpt-5.6-terra-ultra"]);
+const CODEX_MODEL_PREFIXES = new Set(["cx", "codex"]);
 const DEEPSEEK_THINKING_FAMILY = "deepseek-thinking";
 const DEEPSEEK_COMPAT = {
   thinkingFormat: "deepseek",
@@ -202,6 +204,14 @@ function rootModelKey(model: { id?: string; root?: string }) {
   return normalizeModelToken(root);
 }
 
+function isSyntheticCodexUltraAlias(model: { id: string; root?: string; owned_by?: string }) {
+  const owner = normalizeModelToken(model.owned_by);
+  const prefix = normalizeModelToken(model.id.split("/", 1)[0]);
+  const isCodexModel = owner ? owner === "codex" : CODEX_MODEL_PREFIXES.has(prefix ?? "");
+
+  return isCodexModel && SYNTHETIC_CODEX_ULTRA_ROOTS.has(rootModelKey(model) ?? "");
+}
+
 function mergeEffortIntoIndex(index: Map<string, ReasoningEffort[]>, key: string | undefined, efforts: ReasoningEffort[]) {
   if (!key) return;
   index.set(key, mergeReasoningEfforts(index.get(key) ?? [], efforts));
@@ -279,7 +289,7 @@ function resolveVerifiedVariantBase(
 
 function normalizeModels(rawModels: OmnirouteModel[], effortIndex: SupplementalEffortIndex): ProviderModel[] {
   const deduped = new Map<string, OmnirouteModel>();
-  for (const model of rawModels.filter((candidate) => candidate?.id && isTextModel(candidate))) {
+  for (const model of rawModels.filter((candidate) => candidate?.id && isTextModel(candidate) && !isSyntheticCodexUltraAlias(candidate))) {
     const current = deduped.get(model.id);
     deduped.set(model.id, current ? betterModel(current, model) : model);
   }
@@ -481,7 +491,7 @@ function readCachedModels(baseUrl: string): ProviderModel[] {
       return [];
     }
 
-    return cache.models;
+    return cache.models.filter((model) => !isSyntheticCodexUltraAlias(model));
   } catch (error) {
     if (errorCode(error) !== "ENOENT") {
       console.warn(`[${PROVIDER}] Could not read model cache at ${cachePath}: ${errorMessage(error)}`);

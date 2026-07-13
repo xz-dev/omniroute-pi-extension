@@ -686,6 +686,32 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
+  it("hides synthetic Codex ultra aliases from an existing offline cache", async () => {
+    process.env.PI_OFFLINE = "1";
+    const baseUrl = "https://omniroute-cache.example/api/v1";
+    const cachePath = join(tempDir, "offline-ultra-cache.json");
+    const cache = JSON.parse(createValidCacheJson(baseUrl));
+    const template = cache.models[0];
+    cache.models = [
+      template,
+      { ...template, id: "cx/gpt-5.6-sol-ultra", name: "gpt-5.6-sol-ultra" },
+      { ...template, id: "codex/gpt-5.6-terra-ultra", name: "gpt-5.6-terra-ultra" },
+      { ...template, id: "cx/gpt-5.7-ultra", name: "gpt-5.7-ultra" },
+      { ...template, id: "other/gpt-5.6-sol-ultra", name: "gpt-5.6-sol-ultra" },
+    ];
+    await writeFile(cachePath, `${JSON.stringify(cache, null, 2)}\n`);
+    configureCacheStartup(baseUrl, cachePath, []);
+
+    const harness = createHarness();
+    await extension(harness.api);
+
+    const ids = modelIds(latestProvider(harness));
+    assert.equal(ids.includes("cx/gpt-5.6-sol-ultra"), false, "a stale alias-prefixed Sol ultra cache entry should be hidden");
+    assert.equal(ids.includes("codex/gpt-5.6-terra-ultra"), false, "a stale canonical Terra ultra cache entry should be hidden");
+    assert.equal(ids.includes("cx/gpt-5.7-ultra"), true, "other cached Codex ultra IDs should remain routable");
+    assert.equal(ids.includes("other/gpt-5.6-sol-ultra"), true, "another provider's cached ultra model should remain routable");
+  });
+
   it("uses cache-hit startup refresh and lets TUI session_start reuse the in-flight request", async () => {
     const server = await createFixtureServer();
     try {
@@ -944,7 +970,7 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
-  it("folds only verified reasoning suffix variants and keeps max distinct from xhigh", async () => {
+  it("folds verified reasoning variants, preserves max, and hides synthetic Codex ultra aliases", async () => {
     const primaryBody = JSON.stringify({
       data: [
         {
@@ -992,10 +1018,46 @@ describe("OmniRoute model catalog cache", () => {
           output_modalities: ["text"],
         },
         {
+          id: "cx/gpt-5.6-terra",
+          object: "model",
+          root: "gpt-5.6-terra",
+          owned_by: "codex",
+          capabilities: { reasoning: true },
+          output_modalities: ["text"],
+        },
+        {
+          id: "cx/gpt-5.6-terra-max",
+          object: "model",
+          root: "gpt-5.6-terra-max",
+          owned_by: "codex",
+          output_modalities: ["text"],
+        },
+        {
           id: "cx/gpt-5.6-sol-ultra",
           object: "model",
           root: "gpt-5.6-sol-ultra",
           owned_by: "codex",
+          output_modalities: ["text"],
+        },
+        {
+          id: "cx/gpt-5.6-terra-ultra",
+          object: "model",
+          root: "gpt-5.6-terra-ultra",
+          owned_by: "codex",
+          output_modalities: ["text"],
+        },
+        {
+          id: "cx/gpt-5.7-ultra",
+          object: "model",
+          root: "gpt-5.7-ultra",
+          owned_by: "codex",
+          output_modalities: ["text"],
+        },
+        {
+          id: "other/gpt-5.6-sol-ultra",
+          object: "model",
+          root: "gpt-5.6-sol-ultra",
+          owned_by: "other-provider",
           output_modalities: ["text"],
         },
       ],
@@ -1066,7 +1128,13 @@ describe("OmniRoute model catalog cache", () => {
         assert.equal(models.some((candidate) => candidate.id === `codex/gpt-5.6-sol-${effort}`), false, `verified ${effort} variants should fold into the canonical base`);
       }
       assert.equal(models.some((candidate) => candidate.id === "aug/gpt-5.5-high"), true, "a whitelisted suffix without an eligible text base must remain routable even when a same-ID base is image-only and the variant advertises effort tiers");
-      assert.equal(models.some((candidate) => candidate.id === "cx/gpt-5.6-sol-ultra"), true, "unknown future suffixes must remain untouched");
+      const terra = models.find((candidate) => candidate.id === "cx/gpt-5.6-terra");
+      assert.ok(terra, "the Codex Terra base should remain registered");
+      assert.equal(terra.thinkingLevelMap?.max, "max", "hiding ultra must not remove Terra's supported max effort");
+      assert.equal(models.some((candidate) => candidate.id === "cx/gpt-5.6-sol-ultra"), false, "the synthetic Codex Sol ultra alias should be hidden");
+      assert.equal(models.some((candidate) => candidate.id === "cx/gpt-5.6-terra-ultra"), false, "the synthetic Codex Terra ultra alias should be hidden");
+      assert.equal(models.some((candidate) => candidate.id === "cx/gpt-5.7-ultra"), true, "other unknown Codex ultra IDs should remain routable");
+      assert.equal(models.some((candidate) => candidate.id === "other/gpt-5.6-sol-ultra"), true, "the Codex-only filter should not hide another provider's ultra model");
     } finally {
       await server.close();
     }
