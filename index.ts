@@ -121,8 +121,8 @@ function betterModel(a: OmnirouteModel, b: OmnirouteModel): OmnirouteModel {
 function normalizeThinkingLevels(efforts: ReasoningEffort[], options?: { xhighValue?: string }) {
   const has = new Set(efforts);
   return {
-    off: has.has("none") ? "none" : null,
-    minimal: null,
+    off: null,
+    minimal: has.has("low") ? "low" : null,
     low: has.has("low") ? "low" : null,
     medium: has.has("medium") ? "medium" : null,
     high: has.has("high") ? "high" : null,

@@ -925,7 +925,7 @@ describe("OmniRoute model catalog cache", () => {
         imageCapable!.thinkingLevelMap,
         {
           off: null,
-          minimal: null,
+          minimal: "low",
           low: "low",
           medium: "medium",
           high: "high",
@@ -1032,15 +1032,15 @@ describe("OmniRoute model catalog cache", () => {
       assert.deepEqual(
         model.thinkingLevelMap,
         {
-          off: "none",
-          minimal: null,
+          off: null,
+          minimal: "low",
           low: "low",
           medium: null,
           high: "high",
           xhigh: null,
           max: "max",
         },
-        "supplemental none and max efforts should map to Pi off and max without conflation",
+        "supplemental efforts should omit Pi off and preserve max without conflation",
       );
       assert.deepEqual(model.input, ["text"], "primary catalog metadata should remain the source of model capabilities");
       assert.equal(model.contextWindow, 128000, "primary catalog metadata should remain the source of context limits");
@@ -1051,8 +1051,8 @@ describe("OmniRoute model catalog cache", () => {
       assert.deepEqual(
         gpt56.thinkingLevelMap,
         {
-          off: "none",
-          minimal: null,
+          off: null,
+          minimal: "low",
           low: "low",
           medium: "medium",
           high: "high",
