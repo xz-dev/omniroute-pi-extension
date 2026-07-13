@@ -108,7 +108,7 @@ Normalization rules:
 - Folds a suffix variant only when its exact suffix-stripped base is present as an eligible text model in the same primary catalog response.
 - Keeps unknown suffixes and whitelisted suffix IDs without an eligible text base independently routable; an image-output model with the same bare ID is not treated as the base, and no bare model ID is synthesized.
 - Infers reasoning efforts from verified suffix variants first, then merges supplemental reasoning-effort metadata when available.
-- Maps `none` to Pi's `off` and preserves `max` as a distinct level above `xhigh`; Pi `minimal` remains unsupported because no compatible OmniRoute effort is mapped.
+- Represents Pi `off` as `null`, so no reasoning effort is sent; maps Pi `minimal` to provider effort `low`; and preserves `xhigh` and `max` as independent levels.
 - Marks a model as reasoning-capable when raw capabilities include `reasoning`/`thinking` or when reasoning efforts are discovered.
 - Maps unsupported thinking levels to `null` in `thinkingLevelMap` so Pi can hide or clamp them.
 - For `deepseek-thinking` family models, maps Pi `xhigh` to provider value `max`.

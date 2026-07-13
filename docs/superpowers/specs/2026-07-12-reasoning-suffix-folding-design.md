@@ -6,7 +6,7 @@ Keep OmniRoute's standard `/models` response as the source of truth for model ID
 
 ## Effort model
 
-The API suffix whitelist is `none`, `low`, `medium`, `high`, `xhigh`, and `max`. Pi exposes `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Map `none` to Pi `off`, preserve `max` as its own level above `xhigh`, and leave `minimal` unsupported because no compatible OmniRoute effort is mapped.
+The API suffix whitelist is `none`, `low`, `medium`, `high`, `xhigh`, and `max`. Pi exposes `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Represent Pi `off` as `null` so the wire effort is omitted, map Pi `minimal` to provider `low`, and preserve `max` as its own level above `xhigh`.
 
 `ultra` and all other unknown suffixes are not interpreted. They remain ordinary model IDs.
 
