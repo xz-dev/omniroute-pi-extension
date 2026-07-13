@@ -48,6 +48,7 @@ Cache entries include:
 Cache behavior:
 
 - Cache files are validated before use.
+- Cached catalogs reapply the exact Codex Sol/Terra synthetic ultra-alias filter, including old offline or headless caches created before the filter existed.
 - Invalid, mismatched, malformed, or empty cache files are ignored.
 - Cache writes are atomic: write to a temporary file, then rename into place.
 - Cache directories are created with mode `0700`; cache files are written with mode `0600`.
@@ -107,6 +108,7 @@ Normalization rules:
 - Recognizes only the suffixes `-none`, `-low`, `-medium`, `-high`, `-xhigh`, and `-max` as reasoning variants.
 - Folds a suffix variant only when its exact suffix-stripped base is present as an eligible text model in the same primary catalog response.
 - Keeps unknown suffixes and whitelisted suffix IDs without an eligible text base independently routable; an image-output model with the same bare ID is not treated as the base, and no bare model ID is synthesized.
+- Hides only the Codex-owned synthetic `gpt-5.6-sol-ultra` and `gpt-5.6-terra-ultra` aliases. Pi has no `ultra` thinking level, and these aliases reduce to the base model with `max` effort in the current transport; other providers and other unknown `-ultra` IDs remain independently routable.
 - Infers reasoning efforts from verified suffix variants first, then merges supplemental reasoning-effort metadata when available.
 - Represents Pi `off` as `null`, so no reasoning effort is sent; maps Pi `minimal` to provider effort `low`; and preserves `xhigh` and `max` as independent levels.
 - Marks a model as reasoning-capable when raw capabilities include `reasoning`/`thinking` or when reasoning efforts are discovered.
@@ -144,6 +146,7 @@ The test suite covers:
 - preserving cached provider/cache when live discovery fails or returns no usable live catalog;
 - real fixture model normalization;
 - successful supplemental reasoning-effort metadata merging;
+- exact Codex Sol/Terra synthetic ultra-alias filtering without affecting `max`, other Codex ultra IDs, or other providers;
 - provider config shape assertions (`name`, `api`, and literal `apiKey` reference);
 - secret non-leakage into cache/fixtures;
 - base URL normalization;
