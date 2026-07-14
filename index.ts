@@ -13,7 +13,7 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 const MAX_ERROR_BODY_LENGTH = 500;
-const CACHE_SCHEMA_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
 const CACHE_PATH_ENV = "OMNIROUTE_MODEL_CACHE_PATH";
 
 interface OmnirouteModel {
@@ -69,7 +69,6 @@ interface ProviderModel {
   name: string;
   reasoning: boolean;
   thinkingLevelMap?: Record<ThinkingLevel, string | null>;
-  compat?: typeof DEEPSEEK_COMPAT;
   input: ProviderInput[];
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
   contextWindow: number;
@@ -91,10 +90,6 @@ const REASONING_EFFORT_SET = new Set<string>(REASONING_EFFORTS);
 const SYNTHETIC_CODEX_ULTRA_ROOTS = new Set(["gpt-5.6-sol-ultra", "gpt-5.6-terra-ultra"]);
 const CODEX_MODEL_PREFIXES = new Set(["cx", "codex"]);
 const DEEPSEEK_THINKING_FAMILY = "deepseek-thinking";
-const DEEPSEEK_COMPAT = {
-  thinkingFormat: "deepseek",
-  requiresReasoningContentOnAssistantMessages: true,
-} as const;
 
 function isTextModel(model: OmnirouteModel): boolean {
   if (model.type === "image") return false;
@@ -269,7 +264,6 @@ function toProviderModel(model: OmnirouteModel, efforts: ReasoningEffort[]): Pro
     name: model.root ?? model.name ?? model.id,
     reasoning,
     ...(reasoning ? { thinkingLevelMap } : {}),
-    ...(reasoning && isDeepseekFamily ? { compat: DEEPSEEK_COMPAT } : {}),
     input: (model.input_modalities?.includes("image") ? ["text", "image"] : ["text"]) as ProviderInput[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: model.context_length ?? model.max_input_tokens ?? DEFAULT_CONTEXT_WINDOW,
@@ -525,7 +519,7 @@ function registerOmnirouteProvider(pi: ExtensionAPI, baseUrl: string, models: Pr
     name: PROVIDER_DISPLAY_NAME,
     baseUrl,
     apiKey: API_KEY_REFERENCE,
-    api: "openai-completions",
+    api: "openai-responses",
     models,
   });
 }

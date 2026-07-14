@@ -5,7 +5,8 @@ This document records the runtime features and invariants implemented by the Omn
 ## Provider registration
 
 - Registers a Pi model provider named `omniroute` with display name `OmniRoute`.
-- Uses Pi's built-in `openai-completions` provider API implementation.
+- Uses Pi's built-in `openai-responses` provider API implementation for every discovered and cached model.
+- The integration suite pins the verified Pi consumer `@xz-dev/pi-ai@0.80.6-xz.41.1.g7944e190` behind the `@earendil-works/pi-ai` development alias and exercises its public lazy Responses API over two HTTP/SSE turns. This records the tested consumer version; it does not establish a minimum supported Pi version.
 - Sends requests to `OMNIROUTE_BASE_URL` and uses the literal Pi config reference `$OMNIROUTE_API_KEY` for request authentication.
 - Registers the provider in every non-metadata Pi startup path where models can be used:
   - interactive TUI sessions;
@@ -39,7 +40,7 @@ When a valid cache exists, it lets Pi Coding Agent interactive startup keep usin
 
 Cache entries include:
 
-- `schemaVersion`;
+- `schemaVersion` (currently `2`, identifying the `openai-responses` transport contract; version `1` completions caches are rejected);
 - `provider`;
 - normalized `baseUrl`;
 - `fetchedAt` timestamp;
@@ -118,19 +119,6 @@ Normalization rules:
 - Uses zero-cost metadata because OmniRoute pricing is not represented by this extension.
 - Defaults context and max-output token values when OmniRoute does not provide them.
 
-## Provider compatibility
-
-DeepSeek thinking-family models receive OpenAI-compatible provider compatibility settings:
-
-```ts
-{
-  thinkingFormat: "deepseek",
-  requiresReasoningContentOnAssistantMessages: true,
-}
-```
-
-Other models use the default Pi `openai-completions` compatibility unless OmniRoute metadata requires no special handling.
-
 ## Validation coverage
 
 The test suite covers:
@@ -148,6 +136,7 @@ The test suite covers:
 - successful supplemental reasoning-effort metadata merging;
 - exact Codex Sol/Terra synthetic ultra-alias filtering without affecting `max`, other Codex ultra IDs, or other providers;
 - provider config shape assertions (`name`, `api`, and literal `apiKey` reference);
+- real Pi Responses consumer behavior across streamed text, visible reasoning summaries, opaque encrypted reasoning continuation, function calls, and function-call outputs;
 - secret non-leakage into cache/fixtures;
 - base URL normalization;
 - default cache path derivation under `PI_CODING_AGENT_DIR`.

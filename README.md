@@ -11,6 +11,7 @@ pi install git:github.com/xz-dev/omniroute-pi-extension
 ## What it does
 
 - Reads `OMNIROUTE_BASE_URL` and `OMNIROUTE_API_KEY`.
+- Registers every OmniRoute model through Pi's built-in `openai-responses` provider API.
 - Registers cached models immediately when a valid Model Catalog Cache exists.
 - Falls back to live discovery when needed.
 - Writes the normalized Model Catalog Cache under `PI_CODING_AGENT_DIR` unless `OMNIROUTE_MODEL_CACHE_PATH` is set.
@@ -35,7 +36,7 @@ ${PI_CODING_AGENT_DIR:-~/.pi/agent}/omniroute/models-<first 16 hex chars of sha2
 
 ## Commands
 
-- `npm test` — run the test suite.
+- `npm test` — run the test suite, including the two-turn Responses consumer contract pinned to `@xz-dev/pi-ai@0.80.6-xz.41.1.g7944e190` through the `@earendil-works/pi-ai` development alias.
 - `npm run check` — run syntax checks and tests.
 - `npm run check:syntax` — run the Node syntax check used by the test flow.
 

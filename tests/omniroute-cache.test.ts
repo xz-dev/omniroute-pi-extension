@@ -260,7 +260,7 @@ async function readFixtureModels() {
 function createValidCacheJson(baseUrl: string, modelId = "cached-test-model") {
   return `${JSON.stringify(
     {
-      schemaVersion: 1,
+      schemaVersion: 2,
       provider: "omniroute",
       baseUrl,
       fetchedAt: "2026-06-20T00:00:00.000Z",
@@ -390,6 +390,7 @@ describe("OmniRoute model catalog cache", () => {
       const interactive = createHarness();
       await extension(interactive.api);
       assert.deepEqual(modelIds(latestProvider(interactive)), ["cached-test-model"], "interactive TUI startup should register the cached provider immediately");
+      assert.equal(latestProvider(interactive)!.config.api, "openai-responses", "cached startup should use Pi's Responses provider API");
       assert.equal(latestProvider(interactive)!.config.apiKey, "$OMNIROUTE_API_KEY", "cached startup should keep the literal discovery key reference");
       assert.equal(interactiveServer.responses, 0, "interactive startup should not wait for background refresh before returning");
 
@@ -449,6 +450,19 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
+  it("does not register an old completions cache without an API key", async () => {
+    const cachePath = join(tempDir, "models-v1.json");
+    const baseUrl = "https://offline.invalid";
+    await writeFile(cachePath, createValidCacheJson(baseUrl).replace('"schemaVersion": 2', '"schemaVersion": 1'));
+    configureCacheStartup(baseUrl, cachePath, ["--print"]);
+    delete process.env.OMNIROUTE_API_KEY;
+
+    const harness = createHarness();
+    await assert.doesNotReject(() => extension(harness.api));
+
+    assert.equal(harness.registeredProviders.length, 0, "v1 completions caches must not register Responses models");
+  });
+
   it("registers cached models for headless startup modes without refreshing", async () => {
     const server = await createFixtureServer();
     try {
@@ -486,8 +500,8 @@ describe("OmniRoute model catalog cache", () => {
       const mismatchedBaseUrl = `${server.baseUrl}-other`;
       const cases = [
         {
-          name: "wrong schema version",
-          content: createValidCacheJson(validBaseUrl).replace('"schemaVersion": 1', '"schemaVersion": 2'),
+          name: "old completions cache schema",
+          content: createValidCacheJson(validBaseUrl).replace('"schemaVersion": 2', '"schemaVersion": 1'),
           argv: [] as const,
         },
         {
@@ -502,7 +516,7 @@ describe("OmniRoute model catalog cache", () => {
         },
         {
           name: "empty models array",
-          content: `${JSON.stringify({ schemaVersion: 1, provider: "omniroute", baseUrl: validBaseUrl, fetchedAt: "2026-06-20T00:00:00.000Z", models: [] }, null, 2)}\n`,
+          content: `${JSON.stringify({ schemaVersion: 2, provider: "omniroute", baseUrl: validBaseUrl, fetchedAt: "2026-06-20T00:00:00.000Z", models: [] }, null, 2)}\n`,
           argv: [] as const,
         },
         {
@@ -514,7 +528,7 @@ describe("OmniRoute model catalog cache", () => {
           name: "invalid model shape",
           content: `${JSON.stringify(
             {
-              schemaVersion: 1,
+              schemaVersion: 2,
               provider: "omniroute",
               baseUrl: validBaseUrl,
               fetchedAt: "2026-06-20T00:00:00.000Z",
@@ -542,6 +556,7 @@ describe("OmniRoute model catalog cache", () => {
           assert.equal(modelIds(latestProvider(harness)).includes("cached-test-model"), false, `${testCase.name} should not leave the placeholder model in place`);
 
           const normalizedCache = JSON.parse(await readFile(cachePath, "utf8"));
+          assert.equal(normalizedCache.schemaVersion, 2, `${testCase.name} should write the Responses cache schema`);
           assert.equal(normalizedCache.baseUrl, validBaseUrl, `${testCase.name} should write a normalized cache after successful discovery`);
           assert.ok(Array.isArray(normalizedCache.models) && normalizedCache.models.length > 100, `${testCase.name} should persist the normalized live model catalog`);
         }
@@ -672,6 +687,7 @@ describe("OmniRoute model catalog cache", () => {
       const harness = createHarness();
       await extension(harness.api);
       assert.deepEqual(modelIds(latestProvider(harness)), ["cached-test-model"], "offline startup should still register cached models");
+      assert.equal(latestProvider(harness)!.config.api, "openai-responses", "offline cached startup should preserve the provider-wide Responses API");
       startSession(harness, "tui");
       await expectCountToStayStable(() => server.requests, 0, 100, "offline startup/session_start should not hit live discovery");
 
@@ -930,7 +946,7 @@ describe("OmniRoute model catalog cache", () => {
       const liveRegistration = latestProvider(harness)!;
       assert.equal(liveRegistration.name, "omniroute", "live provider should be registered under the OmniRoute provider key");
       assert.equal(liveRegistration.config.name, "OmniRoute", "live provider should expose the OmniRoute display name");
-      assert.equal(liveRegistration.config.api, "openai-completions", "live provider should use Pi's OpenAI-compatible completions API");
+      assert.equal(liveRegistration.config.api, "openai-responses", "live provider should use Pi's OpenAI Responses API");
       assert.ok(
         server.lastModelRequestUrl?.includes("prefix=alias"),
         "live discovery should request the alias prefix mode so the catalog shows short provider aliases instead of full provider ids",
@@ -942,6 +958,16 @@ describe("OmniRoute model catalog cache", () => {
       const textOnly = modelById.get("oc/big-pickle");
       assert.ok(textOnly, "fixture should normalize the text-only Big Pickle model");
       assert.deepEqual(textOnly!.input, ["text"], "text-only models should keep a single text input modality");
+
+      const deepseekThinking = modelById.get("ds/deepseek-v4-pro");
+      assert.ok(deepseekThinking, "fixture should normalize the DeepSeek thinking-family model");
+      assert.equal(deepseekThinking!.reasoning, true, "DeepSeek thinking-family models should remain reasoning-capable");
+      assert.ok(deepseekThinking!.thinkingLevelMap, "DeepSeek thinking-family models should retain their thinking-level map");
+      assert.equal(
+        Object.hasOwn(deepseekThinking!, "compat"),
+        false,
+        "Responses models must not inherit OpenAI Completions-only DeepSeek compatibility",
+      );
 
       const imageCapable = modelById.get("cx/gpt-5.5");
       assert.ok(imageCapable, "fixture should normalize the GPT 5.5 model");
