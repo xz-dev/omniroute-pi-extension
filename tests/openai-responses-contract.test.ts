@@ -4,6 +4,8 @@ import { after, before, test } from "node:test";
 
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 
+// Consumer compatibility coverage for the built-in Responses stream used by this extension.
+
 const reasoningItem = {
   id: "rs_reasoning_1",
   type: "reasoning",
