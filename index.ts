@@ -3,6 +3,16 @@ import { readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type {
+  AssistantMessage,
+  AssistantMessageEvent,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { streamSimple as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER = "omniroute";
@@ -15,6 +25,7 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS = 15_000;
 const MAX_ERROR_BODY_LENGTH = 500;
 const CACHE_SCHEMA_VERSION = 2;
 const CACHE_PATH_ENV = "OMNIROUTE_MODEL_CACHE_PATH";
+const ENCRYPTED_THINKING_LABEL = "[Encrypted thinking...]";
 
 interface OmnirouteModel {
   id: string;
@@ -512,6 +523,46 @@ async function writeModelCache(baseUrl: string, models: ProviderModel[]) {
   await rename(tempPath, cachePath);
 }
 
+function relabelUnreadableThinking(event: AssistantMessageEvent): AssistantMessageEvent {
+  if (event.type === "thinking_end") {
+    const content = event.partial.content[event.contentIndex];
+    if (content?.type === "thinking" && (!content.thinking.trim() || content.redacted)) {
+      content.thinking = ENCRYPTED_THINKING_LABEL;
+      return { ...event, content: ENCRYPTED_THINKING_LABEL };
+    }
+    return event;
+  }
+
+  if (event.type !== "done" && event.type !== "error") return event;
+
+  const message = event.type === "done" ? event.message : event.error;
+  for (const content of message.content) {
+    if (content.type === "thinking" && (!content.thinking.trim() || content.redacted)) {
+      content.thinking = ENCRYPTED_THINKING_LABEL;
+    }
+  }
+
+  return event;
+}
+
+export function wrapOmnirouteThinkingStream(source: AssistantMessageEventStream): AssistantMessageEventStream {
+  const output = createAssistantMessageEventStream();
+
+  void (async () => {
+    for await (const event of source) output.push(relabelUnreadableThinking(event));
+  })();
+
+  return output;
+}
+
+function streamOmniroute(
+  model: Model<"openai-responses">,
+  context: Context,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  return wrapOmnirouteThinkingStream(streamOpenAIResponses(model, context, options));
+}
+
 function registerOmnirouteProvider(pi: ExtensionAPI, baseUrl: string, models: ProviderModel[]) {
   if (models.length === 0) return;
 
@@ -520,6 +571,7 @@ function registerOmnirouteProvider(pi: ExtensionAPI, baseUrl: string, models: Pr
     baseUrl,
     apiKey: API_KEY_REFERENCE,
     api: "openai-responses",
+    streamSimple: streamOmniroute,
     models,
   });
 }
