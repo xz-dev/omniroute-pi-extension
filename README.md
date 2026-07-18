@@ -11,7 +11,7 @@ pi install git:github.com/xz-dev/omniroute-pi-extension
 ## What it does
 
 - Reads `OMNIROUTE_BASE_URL` and `OMNIROUTE_API_KEY`.
-- Registers every OmniRoute model through Pi's built-in `openai-responses` provider API.
+- Registers every OmniRoute model through Pi's built-in `openai-responses` provider API, with an extension-local stream wrapper that preserves readable reasoning and displays `[Encrypted thinking...]` for encrypted, redacted, or otherwise unreadable reasoning blocks.
 - Registers cached models immediately when a valid Model Catalog Cache exists.
 - Falls back to live discovery when needed.
 - Writes the normalized Model Catalog Cache under `PI_CODING_AGENT_DIR` unless `OMNIROUTE_MODEL_CACHE_PATH` is set.

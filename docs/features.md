@@ -5,7 +5,8 @@ This document records the runtime features and invariants implemented by the Omn
 ## Provider registration
 
 - Registers a Pi model provider named `omniroute` with display name `OmniRoute`.
-- Uses Pi's built-in `openai-responses` provider API implementation for every discovered and cached model.
+- Uses Pi's built-in `openai-responses` provider API implementation for every discovered and cached model, wrapped only to normalize unreadable reasoning display.
+- Preserves readable streamed reasoning text. When OmniRoute returns a reasoning block whose content is encrypted, redacted, empty, or otherwise not human-readable, the wrapper supplies `[Encrypted thinking...]` so Pi renders an explicit placeholder instead of a blank thinking block. This behavior belongs to the OmniRoute provider extension and does not change Pi's global thinking visibility setting or other providers.
 - The integration suite pins the verified Pi consumer `@xz-dev/pi-ai@0.80.6-xz.41.1.g7944e190` behind the `@earendil-works/pi-ai` development alias and exercises its public lazy Responses API over two HTTP/SSE turns. This records the tested consumer version; it does not establish a minimum supported Pi version.
 - Sends requests to `OMNIROUTE_BASE_URL` and uses the literal Pi config reference `$OMNIROUTE_API_KEY` for request authentication.
 - Registers the provider in every non-metadata Pi startup path where models can be used:
