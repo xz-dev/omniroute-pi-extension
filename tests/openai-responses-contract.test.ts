@@ -1,10 +1,48 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { after, before, test } from "node:test";
 
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const projectRoot = join(__dirname, "..");
+const piAgentPackagePath = join(
+  projectRoot,
+  "node_modules",
+  "@earendil-works",
+  "pi-coding-agent",
+);
+const piAgentPackageJson = JSON.parse(
+  await readFile(join(piAgentPackagePath, "package.json"), "utf8"),
+) as { dependencies?: Record<string, string> };
+const upstreamPiAiPackageJson = JSON.parse(
+  await readFile(
+    join(
+      piAgentPackagePath,
+      "node_modules",
+      "@earendil-works",
+      "pi-ai",
+      "package.json",
+    ),
+    "utf8",
+  ),
+) as { name?: string; version?: string };
+const { openAIResponsesApi } = await import(
+  pathToFileURL(
+    join(
+      piAgentPackagePath,
+      "node_modules",
+      "@earendil-works",
+      "pi-ai",
+      "dist",
+      "api",
+      "openai-responses.lazy.js",
+    ),
+  ).href
+);
 
-// Consumer compatibility coverage for the built-in Responses stream used by this extension.
+// Consumer compatibility coverage for the upstream Responses stream bundled with Pi.
 
 const reasoningItem = {
   id: "rs_reasoning_1",
@@ -131,7 +169,16 @@ after(async () => {
   );
 });
 
-test("Pi's Responses consumer preserves reasoning and tool-call state across turns", async () => {
+test("uses the upstream Pi-AI dependency bundled with pi-coding-agent", () => {
+  assert.equal(upstreamPiAiPackageJson.name, "@earendil-works/pi-ai");
+  assert.match(upstreamPiAiPackageJson.version ?? "", /^0\.80\./);
+  assert.match(
+    piAgentPackageJson.dependencies?.["@earendil-works/pi-ai"] ?? "",
+    /^\^0\.80\./,
+  );
+});
+
+test("Pi's bundled Responses consumer preserves reasoning and tool-call state across turns", async () => {
   const api = openAIResponsesApi();
   const model = {
     id: "gpt-5.6-sol",

@@ -43,10 +43,7 @@ interface FixtureServer {
   readonly supplementalRequests: number;
   readonly supplementalResponses: number;
   readonly lastModelRequestUrl: string | undefined;
-  waitForRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
   waitForResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
-  waitForSupplementalRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
-  waitForSupplementalResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -178,18 +175,18 @@ async function createFixtureServer(
 ): Promise<FixtureServer> {
   const fixture = await readFile(fixturePath, "utf8");
   const aliasFixture = buildAliasOnlyFixture(fixture);
-  const requestCounter = createWaiterQueue();
+  let requests = 0;
   const responseCounter = createWaiterQueue();
-  const supplementalRequestCounter = createWaiterQueue();
-  const supplementalResponseCounter = createWaiterQueue();
+  let supplementalRequests = 0;
+  let supplementalResponses = 0;
   let lastModelRequestUrl: string | undefined;
 
   const server = http.createServer(async (req, res) => {
     const requestUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
     if (requestUrl.pathname === "/api/v1/vscode/_/models") {
-      supplementalRequestCounter.increment();
+      supplementalRequests += 1;
       res.on("finish", () => {
-        supplementalResponseCounter.increment();
+        supplementalResponses += 1;
       });
 
       res.writeHead(options.supplementalStatus ?? (options.supplementalBody === undefined ? 404 : 200), { "content-type": "application/json" });
@@ -203,7 +200,7 @@ async function createFixtureServer(
     }
 
     lastModelRequestUrl = req.url;
-    requestCounter.increment();
+    requests += 1;
     res.on("finish", () => {
       responseCounter.increment();
     });
@@ -229,24 +226,21 @@ async function createFixtureServer(
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     get requests() {
-      return requestCounter.value;
+      return requests;
     },
     get responses() {
       return responseCounter.value;
     },
     get supplementalRequests() {
-      return supplementalRequestCounter.value;
+      return supplementalRequests;
     },
     get supplementalResponses() {
-      return supplementalResponseCounter.value;
+      return supplementalResponses;
     },
     get lastModelRequestUrl() {
       return lastModelRequestUrl;
     },
-    waitForRequests: (target: number, message: string, timeoutMs?: number) => requestCounter.waitFor(target, message, timeoutMs),
     waitForResponses: (target: number, message: string, timeoutMs?: number) => responseCounter.waitFor(target, message, timeoutMs),
-    waitForSupplementalRequests: (target: number, message: string, timeoutMs?: number) => supplementalRequestCounter.waitFor(target, message, timeoutMs),
-    waitForSupplementalResponses: (target: number, message: string, timeoutMs?: number) => supplementalResponseCounter.waitFor(target, message, timeoutMs),
     close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
   };
 }

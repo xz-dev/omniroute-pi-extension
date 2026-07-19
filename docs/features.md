@@ -7,7 +7,7 @@ This document records the runtime features and invariants implemented by the Omn
 - Registers a Pi model provider named `omniroute` with display name `OmniRoute`.
 - Uses Pi's built-in `openai-responses` provider API implementation directly for every discovered and cached model.
 - Delegates Responses streaming and reasoning rendering to Pi. Readable thinking comes from upstream reasoning summaries, while OmniRoute supplies a visible placeholder when Codex exposes only encrypted private reasoning; the extension does not relabel empty or redacted blocks.
-- The integration suite pins the verified Pi consumer `@xz-dev/pi-ai@0.80.6-xz.41.1.g7944e190` behind the `@earendil-works/pi-ai` development alias and exercises its public lazy Responses API over two HTTP/SSE turns. This records the tested consumer version; it does not establish a minimum supported Pi version.
+- The integration suite uses the upstream `@earendil-works/pi-ai` dependency bundled inside the ordinary `@earendil-works/pi-coding-agent` development dependency and exercises its lazy Responses API over two HTTP/SSE turns. This keeps the test dependency graph aligned with a standard Pi installation instead of a private Pi-AI fork; the peer dependency remains version-agnostic.
 - Sends requests to `OMNIROUTE_BASE_URL` and uses the literal Pi config reference `$OMNIROUTE_API_KEY` for request authentication.
 - Registers the provider in every non-metadata Pi startup path where models can be used:
   - interactive TUI sessions;
