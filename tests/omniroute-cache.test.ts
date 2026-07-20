@@ -29,11 +29,17 @@ interface SessionStartHandler {
   (event: { type: "session_start"; reason: "startup" }, ctx: { mode: string }): void;
 }
 
+interface SessionShutdownHandler {
+  (event: { type: "session_shutdown"; reason: "quit" }, ctx: { mode: string }): void;
+}
+
 interface ExtensionHarness {
   api: ExtensionAPI;
   registeredProviders: RegisteredProvider[];
   readonly registerProviderCalls: number;
   sessionStartHandlers: SessionStartHandler[];
+  sessionShutdownHandlers: SessionShutdownHandler[];
+  invalidateRuntime(): void;
 }
 
 interface FixtureServer {
@@ -43,23 +49,31 @@ interface FixtureServer {
   readonly supplementalRequests: number;
   readonly supplementalResponses: number;
   readonly lastModelRequestUrl: string | undefined;
+  waitForRequests(target: number, message: string, timeoutMs?: number): Promise<void>;
   waitForResponses(target: number, message: string, timeoutMs?: number): Promise<void>;
+  releaseModelResponses(): void;
   close(): Promise<void>;
 }
 
-function createHarness(options: { throwOnRegisterAt?: number } = {}): ExtensionHarness {
+function createHarness(options: { throwOnRegisterAt?: number; invalidateOnShutdown?: boolean } = {}): ExtensionHarness {
   const registeredProviders: RegisteredProvider[] = [];
   let registerProviderCalls = 0;
+  let runtimeInvalidated = false;
   const sessionStartHandlers: SessionStartHandler[] = [];
+  const sessionShutdownHandlers: SessionShutdownHandler[] = [];
 
   const api = {
-    on(event: string, handler: SessionStartHandler) {
-      if (event === "session_start") sessionStartHandlers.push(handler);
+    on(event: string, handler: SessionStartHandler | SessionShutdownHandler) {
+      if (event === "session_start") sessionStartHandlers.push(handler as SessionStartHandler);
+      if (event === "session_shutdown") sessionShutdownHandlers.push(handler as SessionShutdownHandler);
     },
     registerProvider(name: string, config: RegisteredProvider["config"]) {
       registerProviderCalls += 1;
       if (options.throwOnRegisterAt === registerProviderCalls) {
         throw new Error(`registerProvider failed for ${name}`);
+      }
+      if (options.invalidateOnShutdown && runtimeInvalidated) {
+        throw new Error("This extension ctx is stale after session shutdown");
       }
       registeredProviders.push({ name, config });
     },
@@ -72,6 +86,10 @@ function createHarness(options: { throwOnRegisterAt?: number } = {}): ExtensionH
       return registerProviderCalls;
     },
     sessionStartHandlers,
+    sessionShutdownHandlers,
+    invalidateRuntime() {
+      runtimeInvalidated = true;
+    },
   };
 }
 
@@ -87,6 +105,13 @@ function setProcessArgs(args: string[]) {
 function startSession(harness: ExtensionHarness, mode: "tui" | "rpc" | "json") {
   assert.equal(harness.sessionStartHandlers.length, 1, "extension should register exactly one session_start handler");
   harness.sessionStartHandlers[0]!({ type: "session_start", reason: "startup" }, { mode });
+}
+
+function shutdownSession(harness: ExtensionHarness) {
+  for (const handler of harness.sessionShutdownHandlers) {
+    handler({ type: "session_shutdown", reason: "quit" }, { mode: "tui" });
+  }
+  harness.invalidateRuntime();
 }
 
 function latestProvider(harness: ExtensionHarness) {
@@ -171,12 +196,19 @@ function buildAliasOnlyFixture(fixture: string) {
 }
 
 async function createFixtureServer(
-  options: { delayMs?: number; status?: number; body?: string; supplementalBody?: string; supplementalStatus?: number } = {},
+  options: { delayMs?: number; holdModelResponses?: boolean; status?: number; body?: string; supplementalBody?: string; supplementalStatus?: number } = {},
 ): Promise<FixtureServer> {
   const fixture = await readFile(fixturePath, "utf8");
   const aliasFixture = buildAliasOnlyFixture(fixture);
   let requests = 0;
+  const requestCounter = createWaiterQueue();
   const responseCounter = createWaiterQueue();
+  let releaseModelResponses: (() => void) | undefined;
+  const modelResponsesReleased = options.holdModelResponses
+    ? new Promise<void>((resolve) => {
+        releaseModelResponses = resolve;
+      })
+    : Promise.resolve();
   let supplementalRequests = 0;
   let supplementalResponses = 0;
   let lastModelRequestUrl: string | undefined;
@@ -201,10 +233,12 @@ async function createFixtureServer(
 
     lastModelRequestUrl = req.url;
     requests += 1;
+    requestCounter.increment();
     res.on("finish", () => {
       responseCounter.increment();
     });
 
+    await modelResponsesReleased;
     if (options.delayMs) {
       await new Promise((resolve) => setTimeout(resolve, options.delayMs));
     }
@@ -240,8 +274,17 @@ async function createFixtureServer(
     get lastModelRequestUrl() {
       return lastModelRequestUrl;
     },
+    waitForRequests: (target: number, message: string, timeoutMs?: number) => requestCounter.waitFor(target, message, timeoutMs),
     waitForResponses: (target: number, message: string, timeoutMs?: number) => responseCounter.waitFor(target, message, timeoutMs),
-    close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+    releaseModelResponses() {
+      releaseModelResponses?.();
+      releaseModelResponses = undefined;
+    },
+    close: () => {
+      releaseModelResponses?.();
+      releaseModelResponses = undefined;
+      return new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    },
   };
 }
 
@@ -788,6 +831,49 @@ describe("OmniRoute model catalog cache", () => {
     }
   });
 
+  it("does not update a disposed TUI extension after delayed discovery completes", async () => {
+    process.env.OMNIROUTE_MODEL_DISCOVERY_TIMEOUT_MS = "1000";
+    const server = await createFixtureServer({ holdModelResponses: true });
+    try {
+      const cachePath = join(tempDir, "shutdown-during-refresh.json");
+      configureCacheStartup(server.baseUrl, cachePath, []);
+
+      const harness = createHarness({ invalidateOnShutdown: true });
+      const unhandledRejections: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => {
+        unhandledRejections.push(reason);
+      };
+      process.on("unhandledRejection", onUnhandledRejection);
+
+      try {
+        const { warns } = await captureConsoleWarns(async () => {
+          const extensionPromise = extension(harness.api);
+          startSession(harness, "tui");
+          await server.waitForRequests(1, "TUI refresh should start before shutdown");
+          shutdownSession(harness);
+          server.releaseModelResponses();
+          await extensionPromise;
+          const cache = JSON.parse(await readFile(cachePath, "utf8")) as { models?: unknown[] };
+          assert.ok(Array.isArray(cache.models) && cache.models.length > 100, "discovery should persist the normalized model cache after shutdown");
+          await settleAsyncWork();
+        });
+
+        assert.equal(harness.registerProviderCalls, 0, "shutdown should prevent the post-discovery provider update");
+        assert.equal(harness.registeredProviders.length, 0, "shutdown should not register a provider after discovery");
+        assert.equal(
+          warns.some((line) => line.includes("provider update failed")),
+          false,
+          "expected shutdown should not log a provider-update warning",
+        );
+        assert.equal(unhandledRejections.length, 0, "expected shutdown should not create an unhandled rejection");
+      } finally {
+        process.off("unhandledRejection", onUnhandledRejection);
+      }
+    } finally {
+      await server.close();
+    }
+  });
+
   it("handles async provider registration failures without unhandled rejections", async () => {
     const server = await createFixtureServer();
     try {
@@ -1270,4 +1356,19 @@ async function waitForProviderCount(harness: ExtensionHarness, target: number, m
   }
 
   assert.fail(message);
+}
+
+async function waitForRefreshedCache(cachePath: string) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    try {
+      const cache = JSON.parse(await readFile(cachePath, "utf8")) as { models?: unknown[] };
+      if (Array.isArray(cache.models) && cache.models.length > 100) return cache;
+    } catch {
+      // The refresh may still be replacing the cache atomically.
+    }
+    await settleAsyncWork();
+  }
+
+  assert.fail("live discovery should persist the normalized model cache before shutdown completes");
 }

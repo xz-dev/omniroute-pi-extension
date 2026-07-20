@@ -636,6 +636,7 @@ export default async function (pi: ExtensionAPI) {
   if (!baseUrl) return;
 
   const args = getProcessArgs();
+  const sessionLifecycle = new AbortController();
 
   let refreshInFlight: Promise<void> | undefined;
   const scheduleRefresh = () => {
@@ -645,6 +646,7 @@ export default async function (pi: ExtensionAPI) {
     refreshInFlight = (async () => {
       const models = await refreshCacheFromDiscovery(baseUrl);
       if (models.length === 0) return;
+      if (sessionLifecycle.signal.aborted) return;
 
       registerOmnirouteProvider(pi, baseUrl, models);
     })()
@@ -655,6 +657,10 @@ export default async function (pi: ExtensionAPI) {
 
     return refreshInFlight;
   };
+
+  pi.on("session_shutdown", () => {
+    sessionLifecycle.abort();
+  });
 
   pi.on("session_start", (_event, ctx) => {
     if (ctx.mode !== "tui" || isOfflineMode()) return;
